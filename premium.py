@@ -52,7 +52,7 @@ def self_ping():
                 print(f"[{datetime.now()}] 🔁 Self-ping to {url}")
         except Exception as e:
             print(f"[{datetime.now()}] ❌ Self-ping error: {e}")
-        time.sleep(240)  # every 4 minutes
+        time.sleep(240)
 
 # -----------------------------
 # HELPER FUNCTIONS
@@ -67,7 +67,7 @@ def calculate_buy_sell_zones(price):
     buy_zone_2 = round(price*0.995 * 1.015,6)  # 1.5% allowance
     return buy_zone_1, buy_zone_2, sell_zones
 
-async def fetch_coins(per_page=100, total_pages=2, spacing=2):
+async def fetch_coins(per_page=250, total_pages=2, spacing=2):
     coins = []
     for page in range(1, total_pages+1):
         url = "https://api.coingecko.com/api/v3/coins/markets"
@@ -93,7 +93,7 @@ async def fetch_ohlc(coin_id, days=1):
     try:
         response = requests.get(url, params=params)
         response.raise_for_status()
-        return response.json()  # [[timestamp, open, high, low, close, volume], ...]
+        return response.json()  # [[timestamp, open, high, low, close], ...]
     except Exception as e:
         print(f"[{datetime.now()}] ❌ OHLC fetch error {coin_id}: {e}")
         return []
@@ -130,7 +130,7 @@ async def scan_and_post():
 
         total_volume = c.get("total_volume", 0)
         market_cap = c.get("market_cap", 100_000_000)
-        if total_volume < 50_000:
+        if total_volume < 50_000 or total_volume > 10_000_000:  # avoid too small/too large
             continue
 
         ohlc = await fetch_ohlc(c['id'], days=1)
@@ -138,36 +138,42 @@ async def scan_and_post():
             continue
 
         last_candles = ohlc[-5:]
-        opens = [x[1] for x in last_candles]
+        closes = [x[4] for x in last_candles]
         highs = [x[2] for x in last_candles]
         lows = [x[3] for x in last_candles]
-        closes = [x[4] for x in last_candles]
-        volumes = [x[5] for x in last_candles]
+        volumes = [x[4]*x[2] for x in last_candles]  # approximate volume
 
-        # Micro-move
+        # Volatility
+        volatility = (max(highs[-5:]) - min(lows[-5:])) / closes[-1] * 100
+
+        # Micro-move dynamic
         last_move_pct = (closes[-1] - closes[-2]) / closes[-2] * 100
-        if last_move_pct < 0.5:
+        if last_move_pct < 0.2 * volatility:
             continue
 
-        # Consolidation breakout: last 4 candles range < 2%
-        last_range = max(highs[-4:]) - min(lows[-4:])
-        if last_range / closes[-1] > 0.02:
+        # Consolidation breakout
+        last_range_pct = (max(highs[-4:]) - min(lows[-4:])) / closes[-1]
+        if last_range_pct > max(0.02, volatility*0.4):
             continue
 
-        # Volume acceleration: last candle volume vs avg previous 3
+        # Volume acceleration
         avg_prev_vol = sum(volumes[:-1]) / len(volumes[:-1])
-        vol_accel = min(volumes[-1] / avg_prev_vol, 2.0)
+        vol_accel = volumes[-1] / avg_prev_vol
+        if vol_accel < 1.1:
+            continue
+
+        # Trend consistency
+        trend_score = sum([closes[-i] > closes[-i-1] for i in range(1,4)]) / 3
 
         # Market cap bonus
         cap_bonus = min(max(50_000_000 / market_cap, 0.8), 1.2)
 
-        # Signal score
-        score = 0.5*(last_move_pct/5) + 0.3*vol_accel + 0.2*cap_bonus
-
+        # Final score
+        score = 0.4*(last_move_pct/5) + 0.3*vol_accel + 0.2*cap_bonus + 0.1*trend_score
         if score >= 0.75:
             candidates.append((score, c))
 
-    # Sort top 7 candidates
+    # Top 7
     candidates.sort(key=lambda x: x[0], reverse=True)
     top_candidates = [c[1] for c in candidates[:7]]
 
@@ -176,10 +182,10 @@ async def scan_and_post():
         await post_signal(coin)
         posted += 1
 
-    # Notify admin only if no coins found
+    # Admin notification if nothing
     if posted == 0:
         try:
-            await client.send_message(ADMIN_ID, f"❌ No suitable pre-top-gainer candidates found at {datetime.now()}")
+            await client.send_message(ADMIN_ID, f"❌ No suitable pre-top-gainer candidates at {datetime.now()}")
         except Exception as e:
             print(f"[{datetime.now()}] ❌ Failed to notify admin: {e}")
 
@@ -207,7 +213,7 @@ async def manual_trigger(event):
     if user_id != ADMIN_ID:
         await event.reply("❌ You are not authorized.")
         return
-    await event.reply("⏳ Manual scan started — looking for up to 7 coin(s). This may take a few minutes...")
+    await event.reply("⏳ Manual scan started — up to 7 coins...")
     await scan_and_post()
     await event.reply("✅ Manual scan completed.")
 
@@ -217,7 +223,6 @@ async def manual_trigger(event):
 async def main():
     await client.start(bot_token=BOT_TOKEN)
     print("✅ Pre-Top-Gainer Scanner Bot is live")
-    # Start automatic scan loop
     asyncio.create_task(auto_scan_loop())
     await client.run_until_disconnected()
 
