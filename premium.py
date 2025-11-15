@@ -67,22 +67,6 @@ def calculate_buy_sell_zones(price):
     buy_zone_2 = round(price*0.995 * 1.015,6)  # 1.5% allowance
     return buy_zone_1, buy_zone_2, sell_zones
 
-def detect_volume_spike(c, multiplier=1):
-    total_volume = c.get("total_volume", 0)
-    if total_volume <= 0:
-        return 0
-    price_change = abs(c.get("price_change_percentage_24h", 0))
-    spike_factor = price_change * (total_volume / 1_000_000)
-    return spike_factor >= multiplier, spike_factor  # return factor for scoring
-
-def market_cap_bonus(c):
-    # Smaller market cap → higher score (bonus between 0.8–1.2)
-    cap = c.get("market_cap", 100_000_000)
-    if cap <= 0:
-        cap = 100_000_000
-    bonus = min(max(50_000_000 / cap, 0.8), 1.2)
-    return bonus
-
 async def fetch_coins(per_page=50, total_pages=3, spacing=2):
     coins = []
     for page in range(1, total_pages+1):
@@ -116,13 +100,13 @@ async def post_signal(c):
     msg += "Margin 3x"
     await client.send_message(CHANNEL_ID, msg)
     POSTED_COINS.append(symbol)
-    if len(POSTED_COINS) > 20:
+    if len(POSTED_COINS) > 20:  # keep history
         POSTED_COINS.pop(0)
     with open(POSTED_FILE, "w") as f:
         json.dump(POSTED_COINS, f)
 
 # -----------------------------
-# SCAN AND POST PRE-PUMP COINS
+# SCAN AND POST PRE-PUMP COINS (75% pump probability)
 # -----------------------------
 async def scan_and_post():
     coins = await fetch_coins()
@@ -132,22 +116,37 @@ async def scan_and_post():
         symbol = c["symbol"].upper()
         if is_stable(symbol):
             continue
-        price_change = c.get("price_change_percentage_24h", 0)
-        if price_change < 0.3 or price_change > 2:  # micro early pump
-            continue
-        volume = c.get("total_volume",0)
-        if volume < 50_000:  # minimum liquidity
-            continue
-        spike_detected, spike_factor = detect_volume_spike(c)
-        if not spike_detected:
-            continue
-        score = price_change * 0.6 + spike_factor * 0.3
-        score *= market_cap_bonus(c)  # smaller cap bonus
-        candidates.append((score, c))
 
-    # Sort by signal score
+        price_change = c.get("price_change_percentage_24h")
+        if price_change is None:
+            continue
+
+        total_volume = c.get("total_volume", 0)
+        market_cap = c.get("market_cap", 100_000_000)
+
+        # Minimum liquidity
+        if total_volume < 50_000:
+            continue
+
+        # Early micro pump filter (1–5%)
+        if price_change < 1 or price_change > 5:
+            continue
+
+        # Volume spike factor
+        volume_factor = min(total_volume / 1_000_000, 1.0)  # cap at 1.0
+
+        # Market cap bonus (smaller cap → higher score)
+        cap_bonus = min(max(50_000_000 / market_cap, 0.8), 1.2)
+
+        # Signal score: 0–1
+        score = 0.5*(price_change/5) + 0.3*volume_factor + 0.2*cap_bonus
+
+        if score >= 0.75:  # ~75% pump probability
+            candidates.append((score, c))
+
+    # Sort by score descending
     candidates.sort(key=lambda x: x[0], reverse=True)
-    candidates = [c[1] for c in candidates[:7]]  # top 7
+    candidates = [c[1] for c in candidates[:7]]  # top 7 coins
 
     posted = 0
     for coin in candidates:
