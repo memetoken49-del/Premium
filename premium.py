@@ -133,7 +133,6 @@ async def scan_and_post():
         if total_volume < 50_000:
             continue
 
-        # Fetch last 5 OHLC candles
         ohlc = await fetch_ohlc(c['id'], days=1)
         if len(ohlc) < 5:
             continue
@@ -177,8 +176,12 @@ async def scan_and_post():
         await post_signal(coin)
         posted += 1
 
+    # Notify admin only if no coins found
     if posted == 0:
-        await client.send_message(CHANNEL_ID, "❌ No suitable pre-top-gainer candidates found.")
+        try:
+            await client.send_message(ADMIN_ID, f"❌ No suitable pre-top-gainer candidates found at {datetime.now()}")
+        except Exception as e:
+            print(f"[{datetime.now()}] ❌ Failed to notify admin: {e}")
 
 # -----------------------------
 # AUTOMATIC SCAN LOOP
