@@ -64,16 +64,24 @@ def calculate_buy_sell_zones(price):
     percentages = [0.05, 0.12, 0.20, 0.35, 0.55, 0.85, 1.00]
     sell_zones = [round(price*(1+x),6) for x in percentages]
     buy_zone_1 = round(price*0.98,6)
-    buy_zone_2 = round(price*0.995 * 1.015,6)  # 1.5% allowance added
+    buy_zone_2 = round(price*0.995 * 1.015,6)  # 1.5% allowance
     return buy_zone_1, buy_zone_2, sell_zones
 
-def detect_volume_spike(c, multiplier=2):
+def detect_volume_spike(c, multiplier=1):
     total_volume = c.get("total_volume", 0)
     if total_volume <= 0:
-        return False
+        return 0
     price_change = abs(c.get("price_change_percentage_24h", 0))
     spike_factor = price_change * (total_volume / 1_000_000)
-    return spike_factor >= multiplier
+    return spike_factor >= multiplier, spike_factor  # return factor for scoring
+
+def market_cap_bonus(c):
+    # Smaller market cap → higher score (bonus between 0.8–1.2)
+    cap = c.get("market_cap", 100_000_000)
+    if cap <= 0:
+        cap = 100_000_000
+    bonus = min(max(50_000_000 / cap, 0.8), 1.2)
+    return bonus
 
 async def fetch_coins(per_page=50, total_pages=3, spacing=2):
     coins = []
@@ -84,24 +92,12 @@ async def fetch_coins(per_page=50, total_pages=3, spacing=2):
             "order": "market_cap_desc",
             "per_page": per_page,
             "page": page,
-            "sparkline": "false",
-            "price_change_percentage": "24h"
+            "sparkline": "false"
         }
         try:
             response = requests.get(url, params=params)
             response.raise_for_status()
-            data = response.json()
-            # Filter only Binance-listed coins
-            filtered = []
-            for coin_json in data:
-                is_binance = False
-                for t in coin_json.get("tickers", []):
-                    if t.get("market", {}).get("identifier") == "binance":
-                        is_binance = True
-                        break
-                if is_binance:
-                    filtered.append(coin_json)
-            coins.extend(filtered)
+            coins.extend(response.json())
         except Exception as e:
             print(f"[{datetime.now()}] ❌ Fetch error page {page}: {e}")
         await asyncio.sleep(spacing)
@@ -120,7 +116,7 @@ async def post_signal(c):
     msg += "Margin 3x"
     await client.send_message(CHANNEL_ID, msg)
     POSTED_COINS.append(symbol)
-    if len(POSTED_COINS) > 20:  # keep history
+    if len(POSTED_COINS) > 20:
         POSTED_COINS.pop(0)
     with open(POSTED_FILE, "w") as f:
         json.dump(POSTED_COINS, f)
@@ -136,22 +132,25 @@ async def scan_and_post():
         symbol = c["symbol"].upper()
         if is_stable(symbol):
             continue
-        if c.get("total_volume",0) < 200_000:
+        price_change = c.get("price_change_percentage_24h", 0)
+        if price_change < 0.3 or price_change > 2:  # micro early pump
             continue
-        if c.get("price_change_percentage_24h") is None or c["price_change_percentage_24h"] < 1 or c["price_change_percentage_24h"] > 9:
+        volume = c.get("total_volume",0)
+        if volume < 50_000:  # minimum liquidity
             continue
-        if not detect_volume_spike(c):
+        spike_detected, spike_factor = detect_volume_spike(c)
+        if not spike_detected:
             continue
-        candidates.append(c)
+        score = price_change * 0.6 + spike_factor * 0.3
+        score *= market_cap_bonus(c)  # smaller cap bonus
+        candidates.append((score, c))
 
-    # Sort by 24h gain descending
-    candidates.sort(key=lambda x: x["price_change_percentage_24h"], reverse=True)
+    # Sort by signal score
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    candidates = [c[1] for c in candidates[:7]]  # top 7
 
-    # Post up to 7 coins
     posted = 0
     for coin in candidates:
-        if posted >= 7:
-            break
         await post_signal(coin)
         posted += 1
 
