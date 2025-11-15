@@ -87,6 +87,17 @@ async def fetch_coins(per_page=50, total_pages=3, spacing=2):
         await asyncio.sleep(spacing)
     return coins
 
+async def fetch_ohlc(coin_id, days=1):
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc"
+    params = {"vs_currency": "usd", "days": days}
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        return response.json()  # [[timestamp, open, high, low, close], ...]
+    except Exception as e:
+        print(f"[{datetime.now()}] ❌ OHLC fetch error {coin_id}: {e}")
+        return []
+
 async def post_signal(c):
     global POSTED_COINS
     symbol = c["symbol"].upper() + "/USDT (Binance)"
@@ -106,7 +117,7 @@ async def post_signal(c):
         json.dump(POSTED_COINS, f)
 
 # -----------------------------
-# SCAN AND POST PRE-PUMP COINS (75% pump probability)
+# SCAN AND POST PRE-PUMP COINS (Chart Formation)
 # -----------------------------
 async def scan_and_post():
     coins = await fetch_coins()
@@ -128,25 +139,48 @@ async def scan_and_post():
         if total_volume < 50_000:
             continue
 
-        # Early micro pump filter (1–5%)
-        if price_change < 1 or price_change > 5:
+        # Fetch OHLC for last 5 candles
+        ohlc = await fetch_ohlc(c['id'], days=1)
+        if len(ohlc) < 5:
             continue
 
+        last_candles = ohlc[-5:]
+        highs = [x[2] for x in last_candles]
+        lows = [x[3] for x in last_candles]
+        opens = [x[1] for x in last_candles]
+        closes = [x[4] for x in last_candles]
+        current_price = closes[-1]
+
+        # Consolidation check (<2% range)
+        if max(highs) - min(lows) < 0.02 * current_price:
+            consolidation = True
+        else:
+            consolidation = False
+
+        # Breakout candle (>2% up)
+        if closes[-1] > opens[-1] * 1.02:
+            breakout = True
+        else:
+            breakout = False
+
         # Volume spike factor
-        volume_factor = min(total_volume / 1_000_000, 1.0)  # cap at 1.0
+        volume_factor = min(total_volume / 1_000_000, 1.0)
 
         # Market cap bonus (smaller cap → higher score)
         cap_bonus = min(max(50_000_000 / market_cap, 0.8), 1.2)
 
-        # Signal score: 0–1
-        score = 0.5*(price_change/5) + 0.3*volume_factor + 0.2*cap_bonus
+        # Signal score
+        score = 0
+        if consolidation: score += 0.4
+        if breakout: score += 0.6
+        score = score * volume_factor * cap_bonus  # weight by volume & market cap
 
-        if score >= 0.75:  # ~75% pump probability
+        if score >= 0.75:
             candidates.append((score, c))
 
-    # Sort by score descending
+    # Sort top 7
     candidates.sort(key=lambda x: x[0], reverse=True)
-    candidates = [c[1] for c in candidates[:7]]  # top 7 coins
+    candidates = [c[1] for c in candidates[:7]]
 
     posted = 0
     for coin in candidates:
