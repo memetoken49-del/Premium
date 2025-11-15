@@ -181,6 +181,21 @@ async def scan_and_post():
         await client.send_message(CHANNEL_ID, "❌ No suitable pre-top-gainer candidates found.")
 
 # -----------------------------
+# AUTOMATIC SCAN LOOP
+# -----------------------------
+SCAN_INTERVAL = 600  # 10 minutes
+
+async def auto_scan_loop():
+    while True:
+        try:
+            print(f"[{datetime.now()}] ⏳ Starting automatic scan...")
+            await scan_and_post()
+        except Exception as e:
+            print(f"[{datetime.now()}] ❌ Error in auto scan: {e}")
+        print(f"[{datetime.now()}] ✅ Scan completed. Waiting {SCAN_INTERVAL} seconds...")
+        await asyncio.sleep(SCAN_INTERVAL)
+
+# -----------------------------
 # TELEGRAM /signal COMMAND
 # -----------------------------
 @client.on(events.NewMessage(pattern="/signal"))
@@ -199,6 +214,8 @@ async def manual_trigger(event):
 async def main():
     await client.start(bot_token=BOT_TOKEN)
     print("✅ Pre-Top-Gainer Scanner Bot is live")
+    # Start automatic scan loop
+    asyncio.create_task(auto_scan_loop())
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
