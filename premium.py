@@ -37,7 +37,7 @@ client = TelegramClient("pre_pump_session", API_ID, API_HASH)
 app = Flask(__name__)
 @app.route("/")
 def home():
-    return "✅ Pre-Pump Scanner Bot Running"
+    return "✅ Pre-Top-Gainer Scanner Bot Running"
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
@@ -117,10 +117,10 @@ async def post_signal(c):
         json.dump(POSTED_COINS, f)
 
 # -----------------------------
-# SCAN AND POST PRE-PUMP COINS (Chart Formation)
+# SCAN AND POST PRE-TOP-GAINER COINS
 # -----------------------------
 async def scan_and_post():
-    coins = await fetch_coins()
+    coins = await fetch_coins(per_page=100, total_pages=2)  # more coins
     candidates = []
 
     for c in coins:
@@ -128,57 +128,38 @@ async def scan_and_post():
         if is_stable(symbol):
             continue
 
-        price_change = c.get("price_change_percentage_24h")
-        if price_change is None:
-            continue
-
         total_volume = c.get("total_volume", 0)
         market_cap = c.get("market_cap", 100_000_000)
 
-        # Minimum liquidity
-        if total_volume < 50_000:
+        if total_volume < 50_000:  # minimum liquidity
             continue
 
-        # Fetch OHLC for last 5 candles
+        # Fetch last 5 OHLC candles
         ohlc = await fetch_ohlc(c['id'], days=1)
         if len(ohlc) < 5:
             continue
 
         last_candles = ohlc[-5:]
-        highs = [x[2] for x in last_candles]
-        lows = [x[3] for x in last_candles]
         opens = [x[1] for x in last_candles]
         closes = [x[4] for x in last_candles]
-        current_price = closes[-1]
 
-        # Consolidation check (<2% range)
-        if max(highs) - min(lows) < 0.02 * current_price:
-            consolidation = True
-        else:
-            consolidation = False
-
-        # Breakout candle (>2% up)
-        if closes[-1] > opens[-1] * 1.02:
-            breakout = True
-        else:
-            breakout = False
+        # Detect early surge (micro-pump)
+        last_move_pct = (closes[-1] - closes[-2]) / closes[-2] * 100
+        if last_move_pct < 0.5:  # ignore tiny moves
+            continue
 
         # Volume spike factor
         volume_factor = min(total_volume / 1_000_000, 1.0)
-
         # Market cap bonus (smaller cap → higher score)
         cap_bonus = min(max(50_000_000 / market_cap, 0.8), 1.2)
 
-        # Signal score
-        score = 0
-        if consolidation: score += 0.4
-        if breakout: score += 0.6
-        score = score * volume_factor * cap_bonus  # weight by volume & market cap
+        # Signal score: 0–1
+        score = 0.5*(last_move_pct/5) + 0.3*volume_factor + 0.2*cap_bonus
 
-        if score >= 0.75:
+        if score >= 0.75:  # ~75% chance to become top gainer
             candidates.append((score, c))
 
-    # Sort top 7
+    # Sort top 7 candidates by score
     candidates.sort(key=lambda x: x[0], reverse=True)
     candidates = [c[1] for c in candidates[:7]]
 
@@ -188,7 +169,7 @@ async def scan_and_post():
         posted += 1
 
     if posted == 0:
-        await client.send_message(CHANNEL_ID, "❌ No suitable pre-pump candidates found.")
+        await client.send_message(CHANNEL_ID, "❌ No suitable pre-top-gainer candidates found.")
 
 # -----------------------------
 # TELEGRAM /signal COMMAND
@@ -208,7 +189,7 @@ async def manual_trigger(event):
 # -----------------------------
 async def main():
     await client.start(bot_token=BOT_TOKEN)
-    print("✅ Pre-Pump Scanner Bot is live")
+    print("✅ Pre-Top-Gainer Scanner Bot is live")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
