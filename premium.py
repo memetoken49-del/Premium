@@ -67,6 +67,14 @@ def calculate_buy_sell_zones(price):
     buy_zone_2 = round(price*0.995 * 1.015,6)  # 1.5% allowance added
     return buy_zone_1, buy_zone_2, sell_zones
 
+def detect_volume_spike(c, multiplier=2):
+    total_volume = c.get("total_volume", 0)
+    if total_volume <= 0:
+        return False
+    price_change = abs(c.get("price_change_percentage_24h", 0))
+    spike_factor = price_change * (total_volume / 1_000_000)
+    return spike_factor >= multiplier
+
 async def fetch_coins(per_page=50, total_pages=3, spacing=2):
     coins = []
     for page in range(1, total_pages+1):
@@ -76,12 +84,24 @@ async def fetch_coins(per_page=50, total_pages=3, spacing=2):
             "order": "market_cap_desc",
             "per_page": per_page,
             "page": page,
-            "sparkline": "false"
+            "sparkline": "false",
+            "price_change_percentage": "24h"
         }
         try:
             response = requests.get(url, params=params)
             response.raise_for_status()
-            coins.extend(response.json())
+            data = response.json()
+            # Filter only Binance-listed coins
+            filtered = []
+            for coin_json in data:
+                is_binance = False
+                for t in coin_json.get("tickers", []):
+                    if t.get("market", {}).get("identifier") == "binance":
+                        is_binance = True
+                        break
+                if is_binance:
+                    filtered.append(coin_json)
+            coins.extend(filtered)
         except Exception as e:
             print(f"[{datetime.now()}] ❌ Fetch error page {page}: {e}")
         await asyncio.sleep(spacing)
@@ -118,7 +138,9 @@ async def scan_and_post():
             continue
         if c.get("total_volume",0) < 200_000:
             continue
-        if c.get("price_change_percentage_24h") is None or c["price_change_percentage_24h"] < 5:
+        if c.get("price_change_percentage_24h") is None or c["price_change_percentage_24h"] < 1 or c["price_change_percentage_24h"] > 9:
+            continue
+        if not detect_volume_spike(c):
             continue
         candidates.append(c)
 
@@ -155,10 +177,9 @@ async def manual_trigger(event):
 async def main():
     await client.start(bot_token=BOT_TOKEN)
     print("✅ Pre-Pump Scanner Bot is live")
-    # Only manual scans, no automatic loop
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
-    threading.Thread(target=self_ping, daemon=True).start()  # 👈 add this line
+    threading.Thread(target=self_ping, daemon=True).start()
     asyncio.run(main())
