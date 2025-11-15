@@ -67,7 +67,7 @@ def calculate_buy_sell_zones(price):
     buy_zone_2 = round(price*0.995 * 1.015,6)  # 1.5% allowance
     return buy_zone_1, buy_zone_2, sell_zones
 
-async def fetch_coins(per_page=50, total_pages=3, spacing=2):
+async def fetch_coins(per_page=100, total_pages=2, spacing=2):
     coins = []
     for page in range(1, total_pages+1):
         url = "https://api.coingecko.com/api/v3/coins/markets"
@@ -93,7 +93,7 @@ async def fetch_ohlc(coin_id, days=1):
     try:
         response = requests.get(url, params=params)
         response.raise_for_status()
-        return response.json()  # [[timestamp, open, high, low, close], ...]
+        return response.json()  # [[timestamp, open, high, low, close, volume], ...]
     except Exception as e:
         print(f"[{datetime.now()}] ❌ OHLC fetch error {coin_id}: {e}")
         return []
@@ -111,7 +111,7 @@ async def post_signal(c):
     msg += "Margin 3x"
     await client.send_message(CHANNEL_ID, msg)
     POSTED_COINS.append(symbol)
-    if len(POSTED_COINS) > 20:  # keep history
+    if len(POSTED_COINS) > 20:
         POSTED_COINS.pop(0)
     with open(POSTED_FILE, "w") as f:
         json.dump(POSTED_COINS, f)
@@ -120,7 +120,7 @@ async def post_signal(c):
 # SCAN AND POST PRE-TOP-GAINER COINS
 # -----------------------------
 async def scan_and_post():
-    coins = await fetch_coins(per_page=100, total_pages=2)  # more coins
+    coins = await fetch_coins(per_page=250, total_pages=2)
     candidates = []
 
     for c in coins:
@@ -130,8 +130,7 @@ async def scan_and_post():
 
         total_volume = c.get("total_volume", 0)
         market_cap = c.get("market_cap", 100_000_000)
-
-        if total_volume < 50_000:  # minimum liquidity
+        if total_volume < 50_000:
             continue
 
         # Fetch last 5 OHLC candles
@@ -141,30 +140,40 @@ async def scan_and_post():
 
         last_candles = ohlc[-5:]
         opens = [x[1] for x in last_candles]
+        highs = [x[2] for x in last_candles]
+        lows = [x[3] for x in last_candles]
         closes = [x[4] for x in last_candles]
+        volumes = [x[5] for x in last_candles]
 
-        # Detect early surge (micro-pump)
+        # Micro-move
         last_move_pct = (closes[-1] - closes[-2]) / closes[-2] * 100
-        if last_move_pct < 0.5:  # ignore tiny moves
+        if last_move_pct < 0.5:
             continue
 
-        # Volume spike factor
-        volume_factor = min(total_volume / 1_000_000, 1.0)
-        # Market cap bonus (smaller cap → higher score)
+        # Consolidation breakout: last 4 candles range < 2%
+        last_range = max(highs[-4:]) - min(lows[-4:])
+        if last_range / closes[-1] > 0.02:
+            continue
+
+        # Volume acceleration: last candle volume vs avg previous 3
+        avg_prev_vol = sum(volumes[:-1]) / len(volumes[:-1])
+        vol_accel = min(volumes[-1] / avg_prev_vol, 2.0)
+
+        # Market cap bonus
         cap_bonus = min(max(50_000_000 / market_cap, 0.8), 1.2)
 
-        # Signal score: 0–1
-        score = 0.5*(last_move_pct/5) + 0.3*volume_factor + 0.2*cap_bonus
+        # Signal score
+        score = 0.5*(last_move_pct/5) + 0.3*vol_accel + 0.2*cap_bonus
 
-        if score >= 0.75:  # ~75% chance to become top gainer
+        if score >= 0.75:
             candidates.append((score, c))
 
-    # Sort top 7 candidates by score
+    # Sort top 7 candidates
     candidates.sort(key=lambda x: x[0], reverse=True)
-    candidates = [c[1] for c in candidates[:7]]
+    top_candidates = [c[1] for c in candidates[:7]]
 
     posted = 0
-    for coin in candidates:
+    for coin in top_candidates:
         await post_signal(coin)
         posted += 1
 
