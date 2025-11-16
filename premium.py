@@ -64,7 +64,7 @@ def calculate_buy_sell_zones(price):
     percentages = [0.05, 0.12, 0.20, 0.35, 0.55, 0.85, 1.00]
     sell_zones = [round(price*(1+x),6) for x in percentages]
     buy_zone_1 = round(price*0.98,6)
-    buy_zone_2 = round(price*0.995 * 1.015,6)  # 1.5% allowance
+    buy_zone_2 = round(price*0.995 * 1.015,6)
     return buy_zone_1, buy_zone_2, sell_zones
 
 async def fetch_coins(per_page=250, total_pages=2, spacing=2):
@@ -76,7 +76,8 @@ async def fetch_coins(per_page=250, total_pages=2, spacing=2):
             "order": "market_cap_desc",
             "per_page": per_page,
             "page": page,
-            "sparkline": "false"
+            "sparkline": "false",
+            "with_tickers": "true"   # REQUIRED for Binance filtering
         }
         try:
             response = requests.get(url, params=params)
@@ -86,17 +87,6 @@ async def fetch_coins(per_page=250, total_pages=2, spacing=2):
             print(f"[{datetime.now()}] ❌ Fetch error page {page}: {e}")
         await asyncio.sleep(spacing)
     return coins
-
-async def fetch_ohlc(coin_id, days=1):
-    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc"
-    params = {"vs_currency": "usd", "days": days}
-    try:
-        response = requests.get(url, params=params)
-        response.raise_for_status()
-        return response.json()  # [[timestamp, open, high, low, close], ...]
-    except Exception as e:
-        print(f"[{datetime.now()}] ❌ OHLC fetch error {coin_id}: {e}")
-        return []
 
 async def post_signal(c):
     global POSTED_COINS
@@ -117,7 +107,7 @@ async def post_signal(c):
         json.dump(POSTED_COINS, f)
 
 # -----------------------------
-# SCAN AND POST PRE-TOP-GAINER COINS
+# SCAN AND POST (NO OHLC VERSION)
 # -----------------------------
 async def scan_and_post():
     coins = await fetch_coins(per_page=250, total_pages=2)
@@ -128,52 +118,46 @@ async def scan_and_post():
         if is_stable(symbol):
             continue
 
-        total_volume = c.get("total_volume", 0)
-        market_cap = c.get("market_cap", 100_000_000)
-        if total_volume < 50_000 or total_volume > 10_000_000:  # avoid too small/too large
+        # ------------------------------------------------
+        # BINANCE FILTER (only Binance USDT spot coins)
+        # ------------------------------------------------
+        tickers = c.get("tickers", [])
+        listed_on_binance = False
+
+        for t in tickers:
+            market_id = t.get("market", {}).get("identifier", "").lower()
+            target = t.get("target", "").upper()
+            if market_id == "binance" and target == "USDT":
+                listed_on_binance = True
+                break
+
+        if not listed_on_binance:
+            continue
+        # ------------------------------------------------
+
+        price = c.get("current_price", 0)
+        volume = c.get("total_volume", 0)
+        market_cap = c.get("market_cap", 0)
+        p1h = c.get("price_change_percentage_1h_in_currency", 0) or 0
+        p24h = c.get("price_change_percentage_24h", 0) or 0
+
+        if price <= 0:
+            continue
+        if volume < 50_000 or volume > 10_000_000:
+            continue
+        if market_cap == 0:
             continue
 
-        ohlc = await fetch_ohlc(c['id'], days=1)
-        if len(ohlc) < 5:
-            continue
+        # Aggressive simplified scoring
+        score = 0
+        if p1h > 0: score += p1h * 0.25
+        if 0 < p24h < 20: score += 0.2
+        score += min((volume / market_cap) * 500, 0.4)
+        if market_cap < 50_000_000: score += 0.15
 
-        last_candles = ohlc[-5:]
-        closes = [x[4] for x in last_candles]
-        highs = [x[2] for x in last_candles]
-        lows = [x[3] for x in last_candles]
-        volumes = [x[4]*x[2] for x in last_candles]  # approximate volume
-
-        # Volatility
-        volatility = (max(highs[-5:]) - min(lows[-5:])) / closes[-1] * 100
-
-        # Micro-move dynamic
-        last_move_pct = (closes[-1] - closes[-2]) / closes[-2] * 100
-        if last_move_pct < 0.2 * volatility:
-            continue
-
-        # Consolidation breakout
-        last_range_pct = (max(highs[-4:]) - min(lows[-4:])) / closes[-1]
-        if last_range_pct > max(0.02, volatility*0.4):
-            continue
-
-        # Volume acceleration
-        avg_prev_vol = sum(volumes[:-1]) / len(volumes[:-1])
-        vol_accel = volumes[-1] / avg_prev_vol
-        if vol_accel < 1.1:
-            continue
-
-        # Trend consistency
-        trend_score = sum([closes[-i] > closes[-i-1] for i in range(1,4)]) / 3
-
-        # Market cap bonus
-        cap_bonus = min(max(50_000_000 / market_cap, 0.8), 1.2)
-
-        # Final score
-        score = 0.4*(last_move_pct/5) + 0.3*vol_accel + 0.2*cap_bonus + 0.1*trend_score
-        if score >= 0.75:
+        if score >= 0.45:
             candidates.append((score, c))
 
-    # Top 7
     candidates.sort(key=lambda x: x[0], reverse=True)
     top_candidates = [c[1] for c in candidates[:7]]
 
@@ -182,7 +166,6 @@ async def scan_and_post():
         await post_signal(coin)
         posted += 1
 
-    # Admin notification if nothing
     if posted == 0:
         try:
             await client.send_message(ADMIN_ID, f"❌ No suitable pre-top-gainer candidates at {datetime.now()}")
@@ -192,7 +175,7 @@ async def scan_and_post():
 # -----------------------------
 # AUTOMATIC SCAN LOOP
 # -----------------------------
-SCAN_INTERVAL = 600  # 10 minutes
+SCAN_INTERVAL = 600
 
 async def auto_scan_loop():
     while True:
