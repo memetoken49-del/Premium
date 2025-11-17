@@ -116,7 +116,7 @@ async def scan_and_post():
         symbol = c["symbol"].upper()
         if is_stable(symbol):
             continue
-        if c.get("total_volume",0) < 200_000:
+        if c.get("total_volume",0) < 50_000:
             continue
         if c.get("price_change_percentage_24h") is None or c["price_change_percentage_24h"] < 5:
             continue
