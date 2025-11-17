@@ -221,35 +221,69 @@ async def post_signal(c):
     print(f"[{datetime.now()}] ✅ Posted and tracked {symbol} (msg_id={msg_id})")
 
 # -----------------------------
+# -----------------------------
 # SCAN AND POST PRE-PUMP COINS (main scanner logic)
 # -----------------------------
 async def scan_and_post(auto=False):
-    coins = await fetch_coins()
+    coins = await fetch_coins()  # Binance USDT coins only
     candidates = []
 
     for c in coins:
         symbol = c["symbol"].upper()
         if is_stable(symbol):
+            continue  # skip stablecoins
+
+        coin_id = c.get("id")
+        if not coin_id:
             continue
-        if c.get("total_volume",0) < 50_000:
+
+        # Fetch 24h price data for this coin
+        try:
+            history = requests.get(
+                f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart",
+                params={"vs_currency": "usd", "days": 1, "interval": "hourly"},
+                timeout=10
+            ).json()
+
+            prices = history.get("prices", [])
+            if len(prices) < 2:
+                continue
+
+            price_now = float(c.get("current_price"))
+            price_24h_ago = float(prices[0][1])
+            change_24h = ((price_now - price_24h_ago) / price_24h_ago) * 100
+
+            volume_24h = float(history.get("total_volumes", [[0,0]])[-1][1])
+        except Exception as e:
+            print(f"[{datetime.now()}] ❌ Error fetching 24h data for {symbol}: {e}")
             continue
-        if c.get("price_change_percentage_24h") is None or c["price_change_percentage_24h"] < 5:
+
+        # Apply filters
+        if volume_24h < 50_000:
             continue
+        if change_24h < 5:
+            continue
+
+        # add extra info
+        c["price_change_percentage_24h"] = change_24h
+        c["total_volume"] = volume_24h
+
         candidates.append(c)
 
+    # Sort by 24h change descending
     candidates.sort(key=lambda x: x["price_change_percentage_24h"], reverse=True)
 
     if not candidates:
+        msg = "❌ No suitable pre-pump candidates found."
         if auto:
-            await client.send_message(ADMIN_ID, "❌ No suitable pre-pump candidates found in auto scan.")
+            await client.send_message(ADMIN_ID, msg + " (auto scan)")
         else:
-            await client.send_message(ADMIN_ID, "❌ No suitable pre-pump candidates found in manual scan.")
+            await client.send_message(ADMIN_ID, msg + " (manual scan)")
         return
 
     # Only post 1 coin
     coin = candidates[0]
     await post_signal(coin)
-
 # -----------------------------
 # TP Watcher (background loop) — runs every 60 seconds
 # -----------------------------
