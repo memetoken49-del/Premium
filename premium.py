@@ -177,14 +177,13 @@ async def fetch_coins():
 async def post_signal(c):
     """
     Post message to CHANNEL_ID and store metadata in Upstash.
-    If the coin was already posted, append the new message ID instead of overwriting.
+    Supports multiple reposts and tracks original timestamps.
     """
-    symbol = c["symbol"].upper()  # e.g., QNT
+    symbol = c["symbol"].upper()
     full_symbol = f"{symbol}/USDT (Binance)"
     key = f"signal:{symbol}"
 
-    # Check if already exist in Upstash
-    existing = upstash_get(key)
+    # Calculate zones
     price = c["current_price"]
     buy1, buy2, sells = calculate_buy_sell_zones(price)
 
@@ -193,34 +192,35 @@ async def post_signal(c):
     msg += "Sell zone " + " - ".join([str(sz) for sz in sells]) + "\n"
     msg += "Margin 3x"
 
-    # send message and capture message id
+    # send message
     sent = await client.send_message(CHANNEL_ID, msg)
     msg_id = getattr(sent, "id", None)
     now_iso = datetime.now(timezone.utc).isoformat()
 
+    existing = upstash_get(key)
     if existing:
-        # already exists: append new message ID to list
         if isinstance(existing, str):
             try:
                 existing = json.loads(existing)
             except:
                 existing = {}
 
+        # Append new message ID with timestamp
         msg_ids = existing.get("msg_ids", [])
-        msg_ids.append(msg_id)
+        msg_ids.append({"msg_id": msg_id, "posted_at": now_iso})
 
+        # Update payload
         payload = existing
         payload["msg_ids"] = msg_ids
-        payload["buy_price"] = price  # update price in case it changed
-        payload["sell_targets"] = sells  # refresh sell targets
-        payload["posted_at"] = now_iso  # update timestamp
+        payload["buy_price"] = price
+        payload["sell_targets"] = sells
+        payload["posted_at"] = now_iso
         upstash_set(key, payload)
         print(f"[{datetime.now()}] 🔄 Appended new msg_id for {symbol}: {msg_id}")
-
     else:
-        # first time posting
+        # First time posting
         payload = {
-            "msg_ids": [msg_id],
+            "msg_ids": [{"msg_id": msg_id, "posted_at": now_iso}],
             "symbol": symbol,
             "full_symbol": full_symbol,
             "coin_id": c.get("id"),
@@ -243,17 +243,17 @@ async def scan_and_post(auto=False):
     for c in coins:
         symbol = c["symbol"].upper()
         if is_stable(symbol):
-            continue  # skip stablecoins
+            continue
 
         coin_id = c.get("id")
         if not coin_id:
             continue
 
-        # Fetch last 15 minutes of price & volume data
+        # Fetch last 15 minutes price & volume data
         try:
             history = requests.get(
                 f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart",
-                params={"vs_currency": "usd", "days": 0.0105, "interval": "minute"},  # ~15 minutes
+                params={"vs_currency": "usd", "days": 0.0105, "interval": "minute"},
                 timeout=10
             ).json()
 
@@ -269,7 +269,7 @@ async def scan_and_post(auto=False):
 
             volume_now = float(volumes[-1][1])
             volume_earlier = float(volumes[0][1])
-            volume_spike = volume_now / (volume_earlier+1e-6)  # avoid div by 0
+            volume_spike = volume_now / (volume_earlier + 1e-6)
 
         except Exception as e:
             print(f"[{datetime.now()}] ❌ Error fetching short-term data for {symbol}: {e}")
@@ -285,18 +285,16 @@ async def scan_and_post(auto=False):
         c["short_term_volume_ratio"] = volume_spike
         candidates.append(c)
 
-    # Sort by short-term % change descending
+    # Sort descending by short-term % change
     candidates.sort(key=lambda x: x["short_term_change"], reverse=True)
 
     if not candidates:
         msg = "❌ No early pump candidates found."
-        if auto:
-            await client.send_message(ADMIN_ID, msg + " (auto scan)")
-        else:
-            await client.send_message(ADMIN_ID, msg + " (manual scan)")
+        suffix = "(auto scan)" if auto else "(manual scan)"
+        await client.send_message(ADMIN_ID, msg + " " + suffix)
         return
 
-    # Only post top candidate
+    # Only post top candidate (append if already exists)
     coin = candidates[0]
     await post_signal(coin)
 # -----------------------------
@@ -317,7 +315,6 @@ async def tp_watcher_loop(poll_interval=60):
                     upstash_srem_setname("active_signals", symbol)
                     continue
 
-                # Ensure dict
                 if isinstance(data, str):
                     try:
                         data = json.loads(data)
@@ -345,7 +342,6 @@ async def tp_watcher_loop(poll_interval=60):
                 buy_price = float(data.get("buy_price"))
                 sell_targets = data.get("sell_targets", [])
                 if not sell_targets:
-                    # cleanup
                     upstash_srem_setname("active_signals", symbol)
                     upstash_del(key)
                     continue
@@ -363,42 +359,41 @@ async def tp_watcher_loop(poll_interval=60):
                     profit_pct = ((target_price - buy_price) / buy_price) * 100.0
                     leverage_profit = profit_pct * 3.0
 
-                    # calculate period from original posted_at
+                    # Period calculation
                     try:
                         posted_at = datetime.fromisoformat(data.get("posted_at"))
-                        period_delta = datetime.now(timezone.utc) - posted_at
-                        hours, remainder = divmod(int(period_delta.total_seconds()), 3600)
-                        minutes, seconds = divmod(remainder, 60)
+                        delta = datetime.now(timezone.utc) - posted_at
+                        hours, rem = divmod(int(delta.total_seconds()), 3600)
+                        minutes, _ = divmod(rem, 60)
                         period_str = f"{hours} Hours {minutes} Minutes"
-                    except Exception:
+                    except:
                         period_str = "N/A"
 
                     msg = f"Binance\n#{symbol}/USDT Take-Profit target {hit_index+1} ✅\n"
                     msg += f"Profit: {leverage_profit:.4f}% 📈\nPeriod: {period_str} ⏰\n"
 
-                    # find the closest original message by posted_at
-messages = data.get("msg_ids", [])
-if messages:
-    try:
-        original_time = datetime.fromisoformat(data.get("posted_at"))
-        closest_msg = min(
-            messages,
-            key=lambda x: abs(datetime.fromisoformat(x["posted_at"]) - original_time)
-        )
-        original_msg_id = closest_msg["msg_id"]
-    except:
-        original_msg_id = messages[-1]["msg_id"]  # fallback
-else:
-    original_msg_id = None
+                    # Find closest message by posted_at
+                    messages = data.get("msg_ids", [])
+                    original_msg_id = None
+                    if messages:
+                        try:
+                            original_time = datetime.fromisoformat(data.get("posted_at"))
+                            closest_msg = min(
+                                messages,
+                                key=lambda x: abs(datetime.fromisoformat(x["posted_at"]) - original_time)
+                            )
+                            original_msg_id = closest_msg["msg_id"]
+                        except:
+                            original_msg_id = messages[-1]["msg_id"]
 
-# send TP message to closest message
-if original_msg_id:
-    try:
-        await client.send_message(CHANNEL_ID, msg, reply_to=original_msg_id)
-    except Exception as e:
-        print(f"[{datetime.now()}] ❌ Failed to reply TP for {symbol} msg_id={original_msg_id}: {e}")
+                    # send TP message
+                    if original_msg_id:
+                        try:
+                            await client.send_message(CHANNEL_ID, msg, reply_to=original_msg_id)
+                        except Exception as e:
+                            print(f"[{datetime.now()}] ❌ Failed to reply TP for {symbol} msg_id={original_msg_id}: {e}")
 
-                    # remove hit target(s)
+                    # remove hit targets
                     new_targets = sell_targets[hit_index+1:]
                     if new_targets:
                         data["sell_targets"] = new_targets
