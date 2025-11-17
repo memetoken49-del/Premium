@@ -406,6 +406,32 @@ async def tp_watcher_loop(poll_interval=60):
             print(f"[{datetime.now()}] ❌ TP watcher error: {e}")
 
         await asyncio.sleep(poll_interval)
+
+# -----------------------------
+# MONTHLY CLEANUP (runs once a day at midnight UTC)
+# -----------------------------
+async def monthly_cleanup_loop():
+    while True:
+        now = datetime.now(timezone.utc)
+        # Only run at 00:00 UTC
+        if now.hour == 0 and now.minute == 0:
+            # Check if today is the last day of the month
+            next_day = now + timedelta(days=1)
+            if next_day.day == 1:  # tomorrow is the first day of next month
+                print(f"[{datetime.now()}] 🧹 Monthly cleanup running...")
+                
+                symbols = upstash_smembers("active_signals") or []
+                for symbol in symbols:
+                    upstash_del(f"signal:{symbol}")
+                    upstash_srem_setname("active_signals", symbol)
+                
+                print(f"[{datetime.now()}] ✅ Monthly cleanup done for {len(symbols)} signals.")
+            
+            # Sleep 61 seconds to avoid double run in same minute
+            await asyncio.sleep(61)
+        else:
+            # Sleep 30 seconds and check again
+            await asyncio.sleep(30)
 # -----------------------------
 # TELEGRAM /signal COMMAND (manual)
 # -----------------------------
@@ -436,6 +462,7 @@ async def main():
     # start TP watcher background task
     asyncio.create_task(tp_watcher_loop(poll_interval=60))
     asyncio.create_task(auto_scan_loop())
+    asyncio.create_task(monthly_cleanup_loop())
     # Only manual scans (you can still call /signal). Keep bot running:
     await client.run_until_disconnected()
 
