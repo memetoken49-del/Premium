@@ -174,7 +174,7 @@ async def post_signal(c):
     price = c["current_price"]
     buy1, buy2, sells = calculate_buy_sell_zones(price)
 
-    msg = f"🚀 Binance\n#{symbol}/USDT Take-Profit targets\n"
+    msg = f"🚀 Binance\n#{symbol}/USDT\n"
     msg += f"Buy zone {buy1}-{buy2}\n"
     msg += "Sell zone " + " - ".join([str(sz) for sz in sells]) + "\n"
     msg += "Margin 3x"
