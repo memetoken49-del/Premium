@@ -204,7 +204,7 @@ async def post_signal(c):
 # -----------------------------
 # SCAN AND POST PRE-PUMP COINS (main scanner logic)
 # -----------------------------
-async def scan_and_post():
+async def scan_and_post(auto=False):
     coins = await fetch_coins()
     candidates = []
 
@@ -218,19 +218,18 @@ async def scan_and_post():
             continue
         candidates.append(c)
 
-    # Sort by 24h gain descending
     candidates.sort(key=lambda x: x["price_change_percentage_24h"], reverse=True)
 
-    # Post up to 7 coins
-    posted = 0
-    for coin in candidates:
-        if posted >= 7:
-            break
-        await post_signal(coin)
-        posted += 1
+    if not candidates:
+        if auto:
+            await client.send_message(ADMIN_ID, "❌ No suitable pre-pump candidates found in auto scan.")
+        else:
+            await client.send_message(ADMIN_ID, "❌ No suitable pre-pump candidates found in manual scan.")
+        return
 
-    if posted == 0:
-        await client.send_message(CHANNEL_ID, "❌ No suitable pre-pump candidates found.")
+    # Only post 1 coin
+    coin = candidates[0]
+    await post_signal(coin)
 
 # -----------------------------
 # TP Watcher (background loop) — runs every 60 seconds
@@ -358,9 +357,17 @@ async def manual_trigger(event):
     if user_id != ADMIN_ID:
         await event.reply("❌ You are not authorized.")
         return
-    await event.reply("⏳ Manual scan started — looking for up to 7 coin(s). This may take a few minutes...")
-    await scan_and_post()
+    await event.reply("⏳ Manual scan started — checking 1 coin only...")
+    await scan_and_post(auto=False)
     await event.reply("✅ Manual scan completed.")
+# -----------------------------
+# AUTO SCAN LOOP (every 10 minutes)
+# -----------------------------
+async def auto_scan_loop():
+    while True:
+        print(f"[{datetime.now()}] 🔍 Auto scan running...")
+        await scan_and_post(auto=True)
+        await asyncio.sleep(600)  # 10 minutes
 
 # -----------------------------
 # MAIN
@@ -370,6 +377,7 @@ async def main():
     print("✅ Pre-Pump Scanner Bot is live")
     # start TP watcher background task
     asyncio.create_task(tp_watcher_loop(poll_interval=60))
+    asyncio.create_task(auto_scan_loop())
     # Only manual scans (you can still call /signal). Keep bot running:
     await client.run_until_disconnected()
 
