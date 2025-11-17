@@ -132,25 +132,44 @@ def calculate_buy_sell_zones(price):
     buy_zone_2 = round(price*0.995 * 1.015, 6)  # 1.5% allowance added
     return buy_zone_1, buy_zone_2, sell_zones
 
-async def fetch_coins(per_page=50, total_pages=3, spacing=2):
-    coins = []
-    for page in range(1, total_pages+1):
-        url = "https://api.coingecko.com/api/v3/coins/markets"
-        params = {
-            "vs_currency": "usd",
-            "order": "market_cap_desc",
-            "per_page": per_page,
-            "page": page,
-            "sparkline": "false"
-        }
-        try:
-            response = requests.get(url, params=params, timeout=15)
-            response.raise_for_status()
-            coins.extend(response.json())
-        except Exception as e:
-            print(f"[{datetime.now()}] ❌ Fetch error page {page}: {e}")
-        await asyncio.sleep(spacing)
-    return coins
+import requests
+from datetime import datetime
+
+async def fetch_coins():
+    """
+    Returns a list of coins that have a Binance USDT market.
+    Optimized: avoids fetching all tickers individually.
+    """
+    binance_coins = []
+
+    try:
+        # Get all tickers from CoinGecko
+        response = requests.get(
+            "https://api.coingecko.com/api/v3/exchanges/binance/tickers",
+            params={"include_exchange_logo": "false"},
+            timeout=15
+        )
+        response.raise_for_status()
+        data = response.json()
+        tickers = data.get("tickers", [])
+
+        coin_ids = set()
+        for t in tickers:
+            if t.get("target") == "USDT":
+                coin_id = t.get("coin_id")
+                if coin_id and coin_id not in coin_ids:
+                    coin_ids.add(coin_id)
+                    # minimal info needed
+                    binance_coins.append({
+                        "id": coin_id,
+                        "symbol": t.get("base"),
+                        "current_price": t.get("last")
+                    })
+
+    except Exception as e:
+        print(f"[{datetime.now()}] ❌ Error fetching Binance USDT coins: {e}")
+
+    return binance_coins
 
 # -----------------------------
 # SIGNAL POSTING (stores in Upstash and in an 'active_signals' set)
