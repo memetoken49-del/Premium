@@ -237,51 +237,54 @@ async def scan_and_post(auto=False):
         if not coin_id:
             continue
 
-        # Fetch 24h price data for this coin
+        # Fetch last 15 minutes of price & volume data
         try:
             history = requests.get(
                 f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart",
-                params={"vs_currency": "usd", "days": 1, "interval": "hourly"},
+                params={"vs_currency": "usd", "days": 0.0105, "interval": "minute"},  # ~15 minutes
                 timeout=10
             ).json()
 
             prices = history.get("prices", [])
-            if len(prices) < 2:
+            volumes = history.get("total_volumes", [])
+
+            if len(prices) < 2 or len(volumes) < 2:
                 continue
 
             price_now = float(c.get("current_price"))
-            price_24h_ago = float(prices[0][1])
-            change_24h = ((price_now - price_24h_ago) / price_24h_ago) * 100
+            price_earlier = float(prices[0][1])
+            change_short = ((price_now - price_earlier) / price_earlier) * 100
 
-            volume_24h = float(history.get("total_volumes", [[0,0]])[-1][1])
+            volume_now = float(volumes[-1][1])
+            volume_earlier = float(volumes[0][1])
+            volume_spike = volume_now / (volume_earlier+1e-6)  # avoid div by 0
+
         except Exception as e:
-            print(f"[{datetime.now()}] ❌ Error fetching 24h data for {symbol}: {e}")
+            print(f"[{datetime.now()}] ❌ Error fetching short-term data for {symbol}: {e}")
             continue
 
-        # Apply filters
-        if volume_24h < 50_000:
+        # Filters for early pump
+        if change_short < 2:  # price jump ≥2%
             continue
-        if change_24h < 5:
+        if volume_spike < 3:  # volume increased 3x
             continue
 
-        # add extra info
-        c["price_change_percentage_24h"] = change_24h
-        c["total_volume"] = volume_24h
-
+        c["short_term_change"] = change_short
+        c["short_term_volume_ratio"] = volume_spike
         candidates.append(c)
 
-    # Sort by 24h change descending
-    candidates.sort(key=lambda x: x["price_change_percentage_24h"], reverse=True)
+    # Sort by short-term % change descending
+    candidates.sort(key=lambda x: x["short_term_change"], reverse=True)
 
     if not candidates:
-        msg = "❌ No suitable pre-pump candidates found."
+        msg = "❌ No early pump candidates found."
         if auto:
             await client.send_message(ADMIN_ID, msg + " (auto scan)")
         else:
             await client.send_message(ADMIN_ID, msg + " (manual scan)")
         return
 
-    # Only post 1 coin
+    # Only post top candidate
     coin = candidates[0]
     await post_signal(coin)
 # -----------------------------
