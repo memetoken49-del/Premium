@@ -176,20 +176,15 @@ async def fetch_coins():
 # -----------------------------
 async def post_signal(c):
     """
-    Post message to CHANNEL_ID and store metadata in Upstash:
-    Key: signal:{SYMBOL}
-    Value: JSON with msg_id, symbol, coin_id, buy_price, sell_targets, timestamp, posted_by
-    Also adds symbol to Redis set 'active_signals'
+    Post message to CHANNEL_ID and store metadata in Upstash.
+    If the coin was already posted, append the new message ID instead of overwriting.
     """
     symbol = c["symbol"].upper()  # e.g., QNT
     full_symbol = f"{symbol}/USDT (Binance)"
     key = f"signal:{symbol}"
-    # Check if already exist in Upstash (avoid duplicates)
-    existing = upstash_get(key)
-    if existing:
-        # already posted and tracked
-        return
 
+    # Check if already exist in Upstash
+    existing = upstash_get(key)
     price = c["current_price"]
     buy1, buy2, sells = calculate_buy_sell_zones(price)
 
@@ -201,25 +196,42 @@ async def post_signal(c):
     # send message and capture message id
     sent = await client.send_message(CHANNEL_ID, msg)
     msg_id = getattr(sent, "id", None)
-
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    # store metadata in Upstash
-    payload = {
-        "msg_id": msg_id,
-        "symbol": symbol,
-        "full_symbol": full_symbol,
-        "coin_id": c.get("id"),            # coingecko id (used for price fetch)
-        "buy_price": price,
-        "sell_targets": sells,             # list of target prices
-        "posted_at": now_iso,
-        "posted_by": "bot"
-    }
-    upstash_set(key, payload)
-    # add symbol to active set
-    upstash_sadd_setname("active_signals", symbol)
-    print(f"[{datetime.now()}] ✅ Posted and tracked {symbol} (msg_id={msg_id})")
+    if existing:
+        # already exists: append new message ID to list
+        if isinstance(existing, str):
+            try:
+                existing = json.loads(existing)
+            except:
+                existing = {}
 
+        msg_ids = existing.get("msg_ids", [])
+        msg_ids.append(msg_id)
+
+        payload = existing
+        payload["msg_ids"] = msg_ids
+        payload["buy_price"] = price  # update price in case it changed
+        payload["sell_targets"] = sells  # refresh sell targets
+        payload["posted_at"] = now_iso  # update timestamp
+        upstash_set(key, payload)
+        print(f"[{datetime.now()}] 🔄 Appended new msg_id for {symbol}: {msg_id}")
+
+    else:
+        # first time posting
+        payload = {
+            "msg_ids": [msg_id],
+            "symbol": symbol,
+            "full_symbol": full_symbol,
+            "coin_id": c.get("id"),
+            "buy_price": price,
+            "sell_targets": sells,
+            "posted_at": now_iso,
+            "posted_by": "bot"
+        }
+        upstash_set(key, payload)
+        upstash_sadd_setname("active_signals", symbol)
+        print(f"[{datetime.now()}] ✅ Posted and tracked {symbol} (msg_id={msg_id})")
 # -----------------------------
 # -----------------------------
 # SCAN AND POST PRE-PUMP COINS (main scanner logic)
@@ -291,14 +303,6 @@ async def scan_and_post(auto=False):
 # TP Watcher (background loop) — runs every 60 seconds
 # -----------------------------
 async def tp_watcher_loop(poll_interval=60):
-    """
-    This loop checks all active signals stored in Upstash. For each signal it:
-      - fetches current price from CoinGecko
-      - checks each sell target in ascending order
-      - if a target is hit, calculates profit% and multiplies by 3 (margin)
-      - replies to the original message with the TP message
-      - removes hit target(s) and updates Redis; if no targets left, remove signal entirely
-    """
     while True:
         try:
             symbols = upstash_smembers("active_signals") or []
@@ -310,11 +314,10 @@ async def tp_watcher_loop(poll_interval=60):
                 key = f"signal:{symbol}"
                 data = upstash_get(key)
                 if not data:
-                    # remove from active set if data missing
                     upstash_srem_setname("active_signals", symbol)
                     continue
 
-                # data might be stored as JSON string — ensure dict
+                # Ensure dict
                 if isinstance(data, str):
                     try:
                         data = json.loads(data)
@@ -323,10 +326,9 @@ async def tp_watcher_loop(poll_interval=60):
 
                 coin_id = data.get("coin_id")
                 if not coin_id:
-                    # no coingecko id: skip
                     continue
 
-                # fetch current price from CoinGecko simple price API
+                # fetch current price
                 try:
                     cg = requests.get(
                         "https://api.coingecko.com/api/v3/simple/price",
@@ -343,67 +345,72 @@ async def tp_watcher_loop(poll_interval=60):
                 buy_price = float(data.get("buy_price"))
                 sell_targets = data.get("sell_targets", [])
                 if not sell_targets:
-                    # nothing to do, cleanup
+                    # cleanup
                     upstash_srem_setname("active_signals", symbol)
                     upstash_del(key)
                     continue
 
-                # Check targets in ascending order; when hit, send TP message and remove that target
+                # Check targets in ascending order
                 hit_index = None
                 for idx, t in enumerate(sell_targets):
                     t_float = float(t)
-                    # target is hit if current_price >= target
                     if current_price >= t_float:
                         hit_index = idx
                         break
 
                 if hit_index is not None:
                     target_price = float(sell_targets[hit_index])
-                    # profit % (unlevered)
                     profit_pct = ((target_price - buy_price) / buy_price) * 100.0
-                    # leverage 3x
                     leverage_profit = profit_pct * 3.0
-                    # period = now - posted_at
+
+                    # calculate period from original posted_at
                     try:
                         posted_at = datetime.fromisoformat(data.get("posted_at"))
                         period_delta = datetime.now(timezone.utc) - posted_at
-                        # Format period human-friendly
                         hours, remainder = divmod(int(period_delta.total_seconds()), 3600)
                         minutes, seconds = divmod(remainder, 60)
                         period_str = f"{hours} Hours {minutes} Minutes"
                     except Exception:
                         period_str = "N/A"
 
-                    # compose reply message (reply to original message id)
-                    msg = "Binance\n"
-                    msg += f"#{symbol}/USDT Take-Profit target {hit_index+1} ✅\n"
-                    msg += f"Profit: {leverage_profit:.4f}% 📈\n"
-                    msg += f"Period: {period_str} ⏰\n"
+                    msg = f"Binance\n#{symbol}/USDT Take-Profit target {hit_index+1} ✅\n"
+                    msg += f"Profit: {leverage_profit:.4f}% 📈\nPeriod: {period_str} ⏰\n"
 
-                    # reply to original message in same channel (threaded reply)
-                    original_msg_id = data.get("msg_id")
-                    try:
-                        await client.send_message(CHANNEL_ID, msg, reply_to=original_msg_id)
-                        print(f"[{datetime.now()}] ✅ TP hit for {symbol} target {hit_index+1}: {leverage_profit:.4f}%")
-                    except Exception as e:
-                        print(f"[{datetime.now()}] ❌ Failed to reply TP for {symbol}: {e}")
+                    # find the closest original message by posted_at
+messages = data.get("msg_ids", [])
+if messages:
+    try:
+        original_time = datetime.fromisoformat(data.get("posted_at"))
+        closest_msg = min(
+            messages,
+            key=lambda x: abs(datetime.fromisoformat(x["posted_at"]) - original_time)
+        )
+        original_msg_id = closest_msg["msg_id"]
+    except:
+        original_msg_id = messages[-1]["msg_id"]  # fallback
+else:
+    original_msg_id = None
 
-                    # remove that target from list and update storage
-                    new_targets = sell_targets[hit_index+1:]  # remove up to and including hit target
+# send TP message to closest message
+if original_msg_id:
+    try:
+        await client.send_message(CHANNEL_ID, msg, reply_to=original_msg_id)
+    except Exception as e:
+        print(f"[{datetime.now()}] ❌ Failed to reply TP for {symbol} msg_id={original_msg_id}: {e}")
+
+                    # remove hit target(s)
+                    new_targets = sell_targets[hit_index+1:]
                     if new_targets:
                         data["sell_targets"] = new_targets
                         upstash_set(key, data)
                     else:
-                        # no more targets: remove everything
                         upstash_srem_setname("active_signals", symbol)
                         upstash_del(key)
 
-            # sleep until next poll
         except Exception as e:
             print(f"[{datetime.now()}] ❌ TP watcher error: {e}")
 
         await asyncio.sleep(poll_interval)
-
 # -----------------------------
 # TELEGRAM /signal COMMAND (manual)
 # -----------------------------
