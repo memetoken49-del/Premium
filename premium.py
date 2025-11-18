@@ -18,8 +18,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 
+# Optional: your Binance API key (not required for public market endpoints)
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", None)
+
 # Upstash REST API details
-# Defaults are the values you provided; it's safer to set these as env vars in production.
 UPSTASH_REST_URL = os.getenv("UPSTASH_REST_URL", "https://eager-shrew-32373.upstash.io")
 UPSTASH_REDIS_TOKEN = os.getenv("UPSTASH_REDIS_TOKEN", "AX51AAIncDJiMzI3OGMwNWM4OTQ0ZTU0YWU5NzdjODk3NDk5Y2NmZnAyMzIzNzM")
 
@@ -34,7 +36,7 @@ client = TelegramClient("pre_pump_session", API_ID, API_HASH)
 app = Flask(__name__)
 @app.route("/")
 def home():
-    return "✅ Pre-Pump Scanner Bot Running"
+    return "✅ Pre-Pump Scanner Bot Running (Binance API mode)"
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
@@ -57,12 +59,8 @@ def self_ping():
 UP_HEADERS = {"Authorization": f"Bearer {UPSTASH_REDIS_TOKEN}"}
 
 def upstash_set(key: str, value) -> dict:
-    """
-    Stores JSON value at key. Uses POST so value can be JSON body.
-    """
     url = f"{UPSTASH_REST_URL}/set/{key}"
     try:
-        # Send JSON string as POST body (Upstash appends body as last arg)
         resp = requests.post(url, headers=UP_HEADERS, data=json.dumps(value), timeout=10)
         return resp.json()
     except Exception as e:
@@ -117,6 +115,24 @@ def upstash_smembers(setname: str):
         return []
 
 # -----------------------------
+# UTILITIES: Binance helpers
+# -----------------------------
+BINANCE_BASE = "https://api.binance.com"
+COMMON_HEADERS = {}
+if BINANCE_API_KEY:
+    COMMON_HEADERS["X-MBX-APIKEY"] = BINANCE_API_KEY
+
+def binance_get(path, params=None, timeout=10):
+    url = BINANCE_BASE + path
+    try:
+        r = requests.get(url, params=params, headers=COMMON_HEADERS, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"[{datetime.now()}] ❌ Binance GET {path} error: {e}")
+        return None
+
+# -----------------------------
 # HELPER FUNCTIONS (coin logic)
 # -----------------------------
 def is_stable(symbol):
@@ -132,42 +148,50 @@ def calculate_buy_sell_zones(price):
     buy_zone_2 = round(price*0.995 * 1.015, 6)  # 1.5% allowance added
     return buy_zone_1, buy_zone_2, sell_zones
 
-import requests
-from datetime import datetime
-
+# -----------------------------
+# FETCH COINS (Binance-only)
+# -----------------------------
 async def fetch_coins():
     """
     Returns a list of coins that have a Binance USDT market.
-    Optimized: avoids fetching all tickers individually.
+    Uses /api/v3/ticker/24hr to avoid individual requests.
+    Each entry: { 'symbol': base, 'full_symbol': SYMBOL (e.g. RAYUSDT), 'current_price': float, 'quoteVolume': float, 'volume': float }
     """
     binance_coins = []
-
     try:
-        # Get all tickers from CoinGecko
-        response = requests.get(
-            "https://api.coingecko.com/api/v3/exchanges/binance/tickers",
-            params={"include_exchange_logo": "false"},
-            timeout=15
-        )
-        response.raise_for_status()
-        data = response.json()
-        tickers = data.get("tickers", [])
+        data = binance_get("/api/v3/ticker/24hr")
+        if not data:
+            return binance_coins
 
-        coin_ids = set()
-        for t in tickers:
-            if t.get("target") == "USDT":
-                coin_id = t.get("coin_id")
-                if coin_id and coin_id not in coin_ids:
-                    coin_ids.add(coin_id)
-                    # minimal info needed
-                    binance_coins.append({
-                        "id": coin_id,
-                        "symbol": t.get("base"),
-                        "current_price": t.get("last")
-                    })
+        for t in data:
+            sym = t.get("symbol", "")
+            if not sym.endswith("USDT"):
+                continue
+            base = sym[:-4]  # remove 'USDT'
+            try:
+                price = float(t.get("lastPrice", t.get("price", 0) or 0))
+            except:
+                price = 0.0
+            # quoteVolume is volume in quote asset (USDT) — a good proxy for USD volume
+            try:
+                qvol = float(t.get("quoteVolume", 0.0))
+            except:
+                qvol = 0.0
+            try:
+                base_vol = float(t.get("volume", 0.0))
+            except:
+                base_vol = 0.0
+
+            binance_coins.append({
+                "symbol": base,
+                "full_symbol": sym,
+                "current_price": price,
+                "quoteVolume": qvol,
+                "baseVolume": base_vol
+            })
 
     except Exception as e:
-        print(f"[{datetime.now()}] ❌ Error fetching Binance USDT coins: {e}")
+        print(f"[{datetime.now()}] ❌ Error fetching Binance tickers: {e}")
 
     return binance_coins
 
@@ -180,11 +204,11 @@ async def post_signal(c):
     Supports multiple reposts and tracks original timestamps.
     """
     symbol = c["symbol"].upper()
-    full_symbol = f"{symbol}/USDT (Binance)"
+    full_symbol = c["full_symbol"]
     key = f"signal:{symbol}"
 
     # Calculate zones
-    price = c["current_price"]
+    price = float(c["current_price"])
     buy1, buy2, sells = calculate_buy_sell_zones(price)
 
     msg = f"🚀 Binance\n#{symbol}/USDT\n"
@@ -193,7 +217,12 @@ async def post_signal(c):
     msg += "Margin 3x"
 
     # send message
-    sent = await client.send_message(CHANNEL_ID, msg)
+    try:
+        sent = await client.send_message(CHANNEL_ID, msg)
+    except Exception as e:
+        print(f"[{datetime.now()}] ❌ Failed to send message to channel: {e}")
+        return
+
     msg_id = getattr(sent, "id", None)
     now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -223,7 +252,7 @@ async def post_signal(c):
             "msg_ids": [{"msg_id": msg_id, "posted_at": now_iso}],
             "symbol": symbol,
             "full_symbol": full_symbol,
-            "coin_id": c.get("id"),
+            "coin_id": full_symbol,  # we use full_symbol as coin_id analog
             "buy_price": price,
             "sell_targets": sells,
             "posted_at": now_iso,
@@ -232,7 +261,7 @@ async def post_signal(c):
         upstash_set(key, payload)
         upstash_sadd_setname("active_signals", symbol)
         print(f"[{datetime.now()}] ✅ Posted and tracked {symbol} (msg_id={msg_id})")
-# -----------------------------
+
 # -----------------------------
 # SCAN AND POST PRE-PUMP COINS (main scanner logic)
 # -----------------------------
@@ -242,58 +271,54 @@ async def scan_and_post(auto=False):
 
     for c in coins:
         symbol = c["symbol"].upper()
+        full_symbol = c["full_symbol"]
         if is_stable(symbol):
             continue
 
-        coin_id = c.get("id")
-        if not coin_id:
+        # Skip coins with tiny USDT quote volume (day)
+        if float(c.get("quoteVolume", 0.0)) < 100:  # skip extremely low 24h volume
             continue
 
-        # Fetch last 15 minutes price & volume data
+        # Fetch last 15 minutes klines (1m)
         try:
-            history = requests.get(
-                f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart",
-                params={"vs_currency": "usd", "days": 0.0105, "interval": "minute"},
-                timeout=10
-            ).json()
-
-            prices = history.get("prices", [])
-            volumes = history.get("total_volumes", [])
-
-            if len(prices) < 2 or len(volumes) < 2:
+            params = {"symbol": full_symbol, "interval": "1m", "limit": 15}
+            klines = binance_get("/api/v3/klines", params=params)
+            if not klines or len(klines) < 3:
                 continue
 
-            price_now = float(c.get("current_price"))
-            price_earlier = float(prices[0][1])
-            change_short = ((price_now - price_earlier) / price_earlier) * 100
+            # klines: [ [openTime, open, high, low, close, volume, closeTime, quoteAssetVolume, ...], ... ]
+            prices = [float(k[4]) for k in klines]  # close prices
+            quote_volumes = [float(k[7]) for k in klines]  # quote asset volume (USDT)
 
-            volume_now = float(volumes[-1][1])
-            volume_earlier = float(volumes[0][1])
-            volume_spike = volume_now / (volume_earlier + 1e-6)
+            price_now = float(c.get("current_price") or prices[-1])
+            price_earlier = float(prices[0])
+            # protect against zero
+            if price_earlier <= 0:
+                continue
+            change_short = ((price_now - price_earlier) / price_earlier) * 100.0
+
+            volume_now = quote_volumes[-1]  # most recent minute's quote volume
+            volume_earlier = quote_volumes[0] + 1e-9
+            volume_spike = volume_now / volume_earlier
 
         except Exception as e:
-            print(f"[{datetime.now()}] ❌ Error fetching short-term data for {symbol}: {e}")
+            print(f"[{datetime.now()}] ❌ Error fetching klines for {full_symbol}: {e}")
             continue
 
         # -----------------------------
-        # Loosened Pre-Pump Filters
+        # Loosened Pre-Pump Filters (tunable)
         # -----------------------------
-        min_volume_absolute = 500      # must have at least $500 volume
-        volume_spike_threshold = 1.5   # volume must increase 1.5x
-        price_change_threshold = 0.5   # price up at least 0.5%
+        min_volume_absolute = 500.0      # must have at least $500 volume in last minute
+        volume_spike_threshold = 1.5    # volume must increase 1.5x
+        price_change_threshold = 0.5    # price up at least 0.5%
 
         # skip tiny dead coins with almost no liquidity
         if volume_now < min_volume_absolute:
             continue
 
-        # recalc spike
-        volume_spike = volume_now / (volume_earlier + 1e-6)
-
-        # require some activity
         if volume_spike < volume_spike_threshold:
             continue
 
-        # require small early price move
         if change_short < price_change_threshold:
             continue
 
@@ -302,18 +327,22 @@ async def scan_and_post(auto=False):
         c["short_term_volume_ratio"] = volume_spike
         candidates.append(c)
 
-        # Sort descending by short-term % change
-        candidates.sort(key=lambda x: x["short_term_change"], reverse=True)
+    # Sort descending by short-term % change
+    candidates.sort(key=lambda x: x.get("short_term_change", 0.0), reverse=True)
 
     if not candidates:
         msg = "❌ No early pump candidates found."
         suffix = "(auto scan)" if auto else "(manual scan)"
-        await client.send_message(ADMIN_ID, msg + " " + suffix)
+        try:
+            await client.send_message(ADMIN_ID, msg + " " + suffix)
+        except Exception as e:
+            print(f"[{datetime.now()}] ❌ Failed to notify admin: {e}")
         return
 
     # Only post top candidate (append if already exists)
     coin = candidates[0]
     await post_signal(coin)
+
 # -----------------------------
 # TP Watcher (background loop) — runs every 60 seconds
 # -----------------------------
@@ -338,22 +367,20 @@ async def tp_watcher_loop(poll_interval=60):
                     except:
                         pass
 
-                coin_id = data.get("coin_id")
+                full_symbol = data.get("full_symbol") or (symbol + "USDT")
+                coin_id = full_symbol
                 if not coin_id:
                     continue
 
-                # fetch current price
+                # fetch current price (Binance)
                 try:
-                    cg = requests.get(
-                        "https://api.coingecko.com/api/v3/simple/price",
-                        params={"ids": coin_id, "vs_currencies": "usd"},
-                        timeout=10
-                    ).json()
-                    current_price = cg.get(coin_id, {}).get("usd")
-                    if current_price is None:
+                    price_resp = binance_get("/api/v3/ticker/price", params={"symbol": full_symbol})
+                    if not price_resp:
+                        print(f"[{datetime.now()}] ❌ Price response empty for {full_symbol}")
                         continue
+                    current_price = float(price_resp.get("price", 0.0))
                 except Exception as e:
-                    print(f"[{datetime.now()}] ❌ CoinGecko price fetch error for {coin_id}: {e}")
+                    print(f"[{datetime.now()}] ❌ Binance price fetch error for {full_symbol}: {e}")
                     continue
 
                 buy_price = float(data.get("buy_price"))
@@ -436,19 +463,20 @@ async def monthly_cleanup_loop():
             next_day = now + timedelta(days=1)
             if next_day.day == 1:  # tomorrow is the first day of next month
                 print(f"[{datetime.now()}] 🧹 Monthly cleanup running...")
-                
+
                 symbols = upstash_smembers("active_signals") or []
                 for symbol in symbols:
                     upstash_del(f"signal:{symbol}")
                     upstash_srem_setname("active_signals", symbol)
-                
+
                 print(f"[{datetime.now()}] ✅ Monthly cleanup done for {len(symbols)} signals.")
-            
+
             # Sleep 61 seconds to avoid double run in same minute
             await asyncio.sleep(61)
         else:
             # Sleep 30 seconds and check again
             await asyncio.sleep(30)
+
 # -----------------------------
 # TELEGRAM /signal COMMAND (manual)
 # -----------------------------
@@ -461,6 +489,7 @@ async def manual_trigger(event):
     await event.reply("⏳ Manual scan started — checking 1 coin only...")
     await scan_and_post(auto=False)
     await event.reply("✅ Manual scan completed.")
+
 # -----------------------------
 # AUTO SCAN LOOP (every 10 minutes)
 # -----------------------------
@@ -475,12 +504,12 @@ async def auto_scan_loop():
 # -----------------------------
 async def main():
     await client.start(bot_token=BOT_TOKEN)
-    print("✅ Pre-Pump Scanner Bot is live")
-    # start TP watcher background task
+    print("✅ Pre-Pump Scanner Bot is live (Binance mode)")
+    # start TP watcher background tasks
     asyncio.create_task(tp_watcher_loop(poll_interval=60))
     asyncio.create_task(auto_scan_loop())
     asyncio.create_task(monthly_cleanup_loop())
-    # Only manual scans (you can still call /signal). Keep bot running:
+    # Keep bot running:
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
