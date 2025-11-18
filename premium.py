@@ -275,7 +275,7 @@ async def scan_and_post(auto=False):
             print(f"[{datetime.now()}] ❌ Error fetching short-term data for {symbol}: {e}")
             continue
 
-        # -----------------------------
+    # -----------------------------
     # Loosened Pre-Pump Filters
     # -----------------------------
     min_volume_absolute = 500      # must have at least $500 volume
