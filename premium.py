@@ -278,7 +278,7 @@ async def scan_and_post(auto=False):
         # Filters for early pump
         if change_short < 2:  # price jump ≥2%
             continue
-        if volume_spike < 3:  # volume increased 3x
+        if volume_spike < 2:  # volume increased 2x
             continue
 
         c["short_term_change"] = change_short
