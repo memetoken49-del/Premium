@@ -5,3 +5,4 @@ requests
 redis
 aiohttp
 python-dotenv
+python-binance
