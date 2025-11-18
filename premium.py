@@ -275,15 +275,32 @@ async def scan_and_post(auto=False):
             print(f"[{datetime.now()}] ❌ Error fetching short-term data for {symbol}: {e}")
             continue
 
-        # Filters for early pump
-        if change_short < 1:  # price jump ≥1%
-            continue
-        if volume_spike < 2:  # volume increased 2x
-            continue
+        # -----------------------------
+# Loosened Pre-Pump Filters
+# -----------------------------
+min_volume_absolute = 500      # must have at least $500 volume
+volume_spike_threshold = 1.5   # volume must increase 1.5x
+price_change_threshold = 0.5   # price up at least 0.5%
 
-        c["short_term_change"] = change_short
-        c["short_term_volume_ratio"] = volume_spike
-        candidates.append(c)
+# skip tiny dead coins with almost no liquidity
+if volume_now < min_volume_absolute:
+    continue
+
+# recalc spike
+volume_spike = volume_now / (volume_earlier + 1e-6)
+
+# require some activity
+if volume_spike < volume_spike_threshold:
+    continue
+
+# require small early price move
+if change_short < price_change_threshold:
+    continue
+
+# passed filter
+c["short_term_change"] = change_short
+c["short_term_volume_ratio"] = volume_spike
+candidates.append(c)
 
     # Sort descending by short-term % change
     candidates.sort(key=lambda x: x["short_term_change"], reverse=True)
