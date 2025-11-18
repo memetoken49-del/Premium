@@ -4,11 +4,12 @@ import asyncio
 import threading
 import json
 from datetime import datetime, timezone, timedelta
+from collections import deque
+
 from flask import Flask
-from binance.client import Client
 from telethon import TelegramClient, events
+from binance import AsyncClient, BinanceSocketManager
 import requests
-import time
 
 # -----------------------------
 # ENVIRONMENT VARIABLES
@@ -52,12 +53,7 @@ def self_ping():
         except Exception as e:
             print(f"[{datetime.now()}] ❌ Self-ping error: {e}")
         finally:
-            time.sleep(240)
-
-# -----------------------------
-# BINANCE CLIENT
-# -----------------------------
-binance_client = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+            import time; time.sleep(240)
 
 # -----------------------------
 # UPSTASH HELPERS
@@ -134,34 +130,11 @@ def calculate_buy_sell_zones(price):
     return buy_zone_1, buy_zone_2, sell_zones
 
 # -----------------------------
-# FETCH BINANCE COINS
+# SIGNAL POSTING
 # -----------------------------
-async def fetch_binance_usdt_coins():
-    binance_coins = []
-    try:
-        info = binance_client.get_all_tickers()
-        for ticker in info:
-            symbol = ticker['symbol']
-            if symbol.endswith("USDT") and not is_stable(symbol):
-                binance_coins.append({
-                    "symbol": symbol.replace("USDT",""),
-                    "full_symbol": symbol,
-                    "current_price": float(ticker['price'])
-                })
-    except Exception as e:
-        print(f"[{datetime.now()}] ❌ Error fetching Binance coins: {e}")
-    return binance_coins
-
-# -----------------------------
-# POST SIGNAL
-# -----------------------------
-async def post_signal(c):
-    symbol = c["symbol"].upper()
-    full_symbol = c["full_symbol"]
+async def post_signal(symbol, price):
     key = f"signal:{symbol}"
-    price = c["current_price"]
     buy1, buy2, sells = calculate_buy_sell_zones(price)
-
     msg = f"🚀 Binance\n#{symbol}/USDT\nBuy zone {buy1}-{buy2}\nSell zone {' - '.join([str(sz) for sz in sells])}\nMargin 3x"
     sent = await client.send_message(CHANNEL_ID, msg)
     msg_id = getattr(sent, "id", None)
@@ -170,24 +143,17 @@ async def post_signal(c):
     existing = upstash_get(key)
     if existing:
         if isinstance(existing, str):
-            try:
-                existing = json.loads(existing)
-            except:
-                existing = {}
+            try: existing = json.loads(existing)
+            except: existing = {}
         msg_ids = existing.get("msg_ids", [])
         msg_ids.append({"msg_id": msg_id, "posted_at": now_iso})
-        existing.update({
-            "msg_ids": msg_ids,
-            "buy_price": price,
-            "sell_targets": sells,
-            "posted_at": now_iso
-        })
+        existing.update({"msg_ids": msg_ids, "buy_price": price, "sell_targets": sells, "posted_at": now_iso})
         upstash_set(key, existing)
     else:
         payload = {
-            "msg_ids": [{"msg_id": msg_id, "posted_at": now_iso}],
+            "msg_ids":[{"msg_id": msg_id,"posted_at": now_iso}],
             "symbol": symbol,
-            "full_symbol": full_symbol,
+            "full_symbol": symbol+"USDT",
             "buy_price": price,
             "sell_targets": sells,
             "posted_at": now_iso,
@@ -198,52 +164,39 @@ async def post_signal(c):
     print(f"[{datetime.now()}] ✅ Posted {symbol} (msg_id={msg_id})")
 
 # -----------------------------
-# SCAN & POST LOGIC
+# WEBSOCKET COIN MONITOR
 # -----------------------------
-async def scan_and_post(auto=False):
-    coins = await fetch_binance_usdt_coins()
-    candidates = []
+volume_window = {}
+VOLUME_WINDOW_SIZE = 10
+VOLUME_SPIKE_MULTIPLIER = 1.5
+PRICE_CHANGE_THRESHOLD = 0.3  # % price move for micro-pump
 
-    for c in coins:
-        symbol = c["symbol"]
-        try:
-            klines = binance_client.get_klines(symbol=c["full_symbol"], interval="1m", limit=2)
-            price_now = float(klines[-1][4])
-            price_earlier = float(klines[0][4])
-            change_short = ((price_now - price_earlier) / price_earlier) * 100
+async def monitor_trades():
+    client_ws = await AsyncClient.create(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+    bsm = BinanceSocketManager(client_ws)
+    stream = bsm.trade_socket('!miniTicker@arr')  # all symbols
+    async with stream as tscm:
+        async for msg in tscm:
+            symbol = msg['s']
+            if is_stable(symbol): continue
 
-            volume_now = float(klines[-1][5])
-            volume_earlier = float(klines[0][5])
-            volume_spike = volume_now / (volume_earlier + 1e-6)
+            price = float(msg['c'])
+            qty = float(msg['v'])
 
-            if volume_now < 500 or volume_spike < 1.5 or change_short < 0.5:
-                continue
+            # Track volume
+            if symbol not in volume_window:
+                volume_window[symbol] = deque(maxlen=VOLUME_WINDOW_SIZE)
+            vol_deque = volume_window[symbol]
+            avg_volume = sum(vol_deque)/len(vol_deque) if vol_deque else qty
+            vol_deque.append(qty)
 
-            c["short_term_change"] = change_short
-            c["short_term_volume_ratio"] = volume_spike
-            c["current_price"] = price_now
-            candidates.append(c)
-        except Exception as e:
-            print(f"[{datetime.now()}] ❌ Error fetching klines for {symbol}: {e}")
-            continue
+            key = f"signal:{symbol}"
+            prev = upstash_get(key)
+            price_before = float(prev.get("buy_price", price)) if prev else price
+            price_change = ((price - price_before)/price_before)*100
 
-    candidates.sort(key=lambda x: x["short_term_change"], reverse=True)
-
-    if not candidates:
-        suffix = "(auto scan)" if auto else "(manual scan)"
-        await client.send_message(ADMIN_ID, f"❌ No early pump candidates found. {suffix}")
-        return
-
-    await post_signal(candidates[0])
-
-# -----------------------------
-# AUTO SCAN LOOP
-# -----------------------------
-async def auto_scan_loop():
-    while True:
-        print(f"[{datetime.now()}] 🔍 Auto scan running...")
-        await scan_and_post(auto=True)
-        await asyncio.sleep(600)
+            if price_change >= PRICE_CHANGE_THRESHOLD and qty >= avg_volume * VOLUME_SPIKE_MULTIPLIER:
+                await post_signal(symbol, price)
 
 # -----------------------------
 # TP WATCHER LOOP
@@ -257,15 +210,10 @@ async def tp_watcher_loop(poll_interval=60):
             if not data:
                 upstash_srem_setname("active_signals", symbol)
                 continue
-            if isinstance(data, str):
+            if isinstance(data,str):
                 try: data = json.loads(data)
                 except: data = {}
-            try:
-                price_data = binance_client.get_symbol_ticker(symbol=data["full_symbol"])
-                current_price = float(price_data['price'])
-            except:
-                continue
-            buy_price = float(data.get("buy_price"))
+            current_price = float(data.get("buy_price", 0))  # fallback
             sell_targets = data.get("sell_targets", [])
             hit_index = None
             for idx, t in enumerate(sell_targets):
@@ -273,7 +221,7 @@ async def tp_watcher_loop(poll_interval=60):
                     hit_index = idx
                     break
             if hit_index is not None:
-                profit_pct = ((float(sell_targets[hit_index])-buy_price)/buy_price)*100*3
+                profit_pct = ((float(sell_targets[hit_index])-float(data.get("buy_price")))/float(data.get("buy_price")))*100*3
                 msg = f"#{symbol}/USDT Take-Profit target {hit_index+1} ✅\nProfit: {profit_pct:.4f}% 📈"
                 await client.send_message(CHANNEL_ID, msg)
                 new_targets = sell_targets[hit_index+1:]
@@ -286,23 +234,6 @@ async def tp_watcher_loop(poll_interval=60):
         await asyncio.sleep(poll_interval)
 
 # -----------------------------
-# MONTHLY CLEANUP LOOP
-# -----------------------------
-async def monthly_cleanup_loop():
-    while True:
-        now = datetime.now(timezone.utc)
-        if now.hour == 0 and now.minute == 0:
-            print(f"[{datetime.now()}] 🧹 Monthly cleanup running...")
-            symbols = upstash_smembers("active_signals") or []
-            for symbol in symbols:
-                upstash_del(f"signal:{symbol}")
-                upstash_srem_setname("active_signals", symbol)
-            print(f"[{datetime.now()}] ✅ Monthly cleanup done for {len(symbols)} signals.")
-            await asyncio.sleep(61)
-        else:
-            await asyncio.sleep(30)
-
-# -----------------------------
 # MANUAL SCAN COMMAND
 # -----------------------------
 @client.on(events.NewMessage(pattern="/signal"))
@@ -311,7 +242,7 @@ async def manual_trigger(event):
         await event.reply("❌ You are not authorized.")
         return
     await event.reply("⏳ Manual scan started...")
-    await scan_and_post(auto=False)
+    # WebSocket handles live signals; manual trigger just notifies
     await event.reply("✅ Manual scan completed.")
 
 # -----------------------------
@@ -320,9 +251,8 @@ async def manual_trigger(event):
 async def main():
     await client.start(bot_token=BOT_TOKEN)
     print("✅ Pre-Pump Scanner Bot live")
-    asyncio.create_task(auto_scan_loop())
+    asyncio.create_task(monitor_trades())
     asyncio.create_task(tp_watcher_loop())
-    asyncio.create_task(monthly_cleanup_loop())
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
