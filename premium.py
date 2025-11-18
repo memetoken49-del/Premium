@@ -136,7 +136,6 @@ def calculate_buy_sell_zones(price):
 # FETCH BINANCE COINS
 # -----------------------------
 async def fetch_binance_usdt_coins():
-    """Fetch all USDT market symbols from your own Binance API key."""
     binance_coins = []
     try:
         info = binance_client.get_all_tickers()
@@ -157,7 +156,7 @@ async def fetch_binance_usdt_coins():
 # -----------------------------
 async def post_signal(c):
     symbol = c["symbol"].upper()
-    full_symbol = c["full_symbol"]  # already in correct Binance format
+    full_symbol = c["full_symbol"]
     key = f"signal:{symbol}"
     price = c["current_price"]
     buy1, buy2, sells = calculate_buy_sell_zones(price)
@@ -207,19 +206,15 @@ async def scan_and_post(auto=False):
     for c in coins:
         symbol = c["symbol"]
         try:
-            # fetch short-term history using Binance API (recent klines)
             klines = binance_client.get_klines(symbol=c["full_symbol"], interval="1m", limit=2)
             price_now = float(klines[-1][4])
             price_earlier = float(klines[0][4])
             change_short = ((price_now - price_earlier) / price_earlier) * 100
-
             volume_now = float(klines[-1][5])
             volume_earlier = float(klines[0][5])
             volume_spike = volume_now / (volume_earlier + 1e-6)
-
             if volume_now < 500 or volume_spike < 1.5 or change_short < 0.5:
                 continue
-
             c["short_term_change"] = change_short
             c["short_term_volume_ratio"] = volume_spike
             c["current_price"] = price_now
@@ -247,7 +242,7 @@ async def auto_scan_loop():
         await asyncio.sleep(600)
 
 # -----------------------------
-# TP WATCHER LOOP
+# TP WATCHER LOOP WITH 30-DAY CLEANUP
 # -----------------------------
 async def tp_watcher_loop(poll_interval=60):
     while True:
@@ -259,13 +254,32 @@ async def tp_watcher_loop(poll_interval=60):
                 upstash_srem_setname("active_signals", symbol)
                 continue
             if isinstance(data, str):
-                try: data = json.loads(data)
-                except: data = {}
+                try:
+                    data = json.loads(data)
+                except:
+                    data = {}
+
+            # --- REMOVE SIGNALS OLDER THAN 30 DAYS ---
+            try:
+                posted_at_str = data.get("posted_at")
+                if posted_at_str:
+                    posted_at = datetime.fromisoformat(posted_at_str)
+                    if (datetime.now(timezone.utc) - posted_at).days >= 30:
+                        upstash_srem_setname("active_signals", symbol)
+                        upstash_del(key)
+                        print(f"[{datetime.now()}] 🗑 Removed {symbol} due to 30+ days age")
+                        continue
+            except Exception as e:
+                print(f"[{datetime.now()}] ❌ Age check error for {symbol}: {e}")
+
+            # --- FETCH CURRENT PRICE ---
             try:
                 price_data = binance_client.get_symbol_ticker(symbol=data["full_symbol"])
                 current_price = float(price_data['price'])
             except:
                 continue
+
+            # --- CHECK TAKE-PROFIT TARGETS ---
             buy_price = float(data.get("buy_price"))
             sell_targets = data.get("sell_targets", [])
             hit_index = None
@@ -273,8 +287,9 @@ async def tp_watcher_loop(poll_interval=60):
                 if current_price >= float(t):
                     hit_index = idx
                     break
+
             if hit_index is not None:
-                profit_pct = ((float(sell_targets[hit_index])-buy_price)/buy_price)*100*3
+                profit_pct = ((float(sell_targets[hit_index]) - buy_price) / buy_price) * 100 * 3
                 msg = f"#{symbol}/USDT Take-Profit target {hit_index+1} ✅\nProfit: {profit_pct:.4f}% 📈"
                 await client.send_message(CHANNEL_ID, msg)
                 new_targets = sell_targets[hit_index+1:]
