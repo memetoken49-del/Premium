@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+"""
+Pre-Pump Scanner Bot — Binance private API only
+
+Features:
+- Uses only your BINANCE_API_KEY (X-MBX-APIKEY header) for market data
+- Advanced 1-minute klines detector (last 15 minutes)
+- Auto-scan, manual /signal, TP watcher, Upstash persistence, monthly cleanup
+- Flask keep-alive + self-ping
+- Read-only usage (no trading calls)
+"""
+
 import os
 import asyncio
 import requests
@@ -8,9 +19,10 @@ import threading
 import json
 from datetime import datetime, timezone, timedelta
 import time
+from urllib.parse import urlencode
 
 # -----------------------------
-# ENVIRONMENT VARIABLES (set in env if you want)
+# ENVIRONMENT VARIABLES (set in env)
 # -----------------------------
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
@@ -18,12 +30,14 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 
-# Optional: your Binance API key (not required for public market endpoints)
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", None)
-
 # Upstash REST API details
 UPSTASH_REST_URL = os.getenv("UPSTASH_REST_URL", "https://eager-shrew-32373.upstash.io")
 UPSTASH_REDIS_TOKEN = os.getenv("UPSTASH_REDIS_TOKEN", "AX51AAIncDJiMzI3OGMwNWM4OTQ0ZTU0YWU5NzdjODk3NDk5Y2NmZnAyMzIzNzM")
+
+# Binance private API key (READ-ONLY recommended)
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", None)
+if not BINANCE_API_KEY:
+    print("⚠️ Warning: BINANCE_API_KEY not set. Set env var BINANCE_API_KEY to use private Binance API.")
 
 # -----------------------------
 # TELEGRAM CLIENT
@@ -36,19 +50,22 @@ client = TelegramClient("pre_pump_session", API_ID, API_HASH)
 app = Flask(__name__)
 @app.route("/")
 def home():
-    return "✅ Pre-Pump Scanner Bot Running (Binance API mode)"
+    return "✅ Pre-Pump Scanner Bot Running (Binance private API only)"
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
 def self_ping():
+    """
+    Periodically ping RENDER_URL to keep the service alive (if hosted on Render or similar).
+    """
     while True:
         try:
             url = os.environ.get("RENDER_URL")
             if url:
-                requests.get(url, timeout=10)
-                print(f"[{datetime.now()}] 🔁 Self-ping to {url}")
+                resp = requests.get(url, timeout=10)
+                print(f"[{datetime.now()}] 🔁 Self-ping to {url} status {resp.status_code}")
         except Exception as e:
             print(f"[{datetime.now()}] ❌ Self-ping error: {e}")
         time.sleep(240)  # every 4 minutes
@@ -115,14 +132,20 @@ def upstash_smembers(setname: str):
         return []
 
 # -----------------------------
-# UTILITIES: Binance helpers
+# UTILITIES: Binance helpers (private API key via header)
 # -----------------------------
 BINANCE_BASE = "https://api.binance.com"
 COMMON_HEADERS = {}
 if BINANCE_API_KEY:
     COMMON_HEADERS["X-MBX-APIKEY"] = BINANCE_API_KEY
+# Add a user agent to reduce chance of blocking
+COMMON_HEADERS["User-Agent"] = "Mozilla/5.0 (compatible; PrePumpBot/1.0)"
 
 def binance_get(path, params=None, timeout=10):
+    """
+    Uses your BINANCE_API_KEY header for every request (private key use).
+    Note: most of these endpoints don't require signature. We're using the API key header only.
+    """
     url = BINANCE_BASE + path
     try:
         r = requests.get(url, params=params, headers=COMMON_HEADERS, timeout=timeout)
@@ -149,13 +172,12 @@ def calculate_buy_sell_zones(price):
     return buy_zone_1, buy_zone_2, sell_zones
 
 # -----------------------------
-# FETCH COINS (Binance-only)
+# FETCH COINS (Binance-only using private API header)
 # -----------------------------
 async def fetch_coins():
     """
-    Returns a list of coins that have a Binance USDT market.
-    Uses /api/v3/ticker/24hr to avoid individual requests.
-    Each entry: { 'symbol': base, 'full_symbol': SYMBOL (e.g. RAYUSDT), 'current_price': float, 'quoteVolume': float, 'volume': float }
+    Returns a list of USDT coins from Binance /api/v3/ticker/24hr.
+    Each entry contains: symbol (base), full_symbol (e.g. RAYUSDT), current_price, quoteVolume, baseVolume
     """
     binance_coins = []
     try:
@@ -169,10 +191,9 @@ async def fetch_coins():
                 continue
             base = sym[:-4]  # remove 'USDT'
             try:
-                price = float(t.get("lastPrice", t.get("price", 0) or 0))
+                price = float(t.get("lastPrice") or t.get("price") or 0)
             except:
                 price = 0.0
-            # quoteVolume is volume in quote asset (USDT) — a good proxy for USD volume
             try:
                 qvol = float(t.get("quoteVolume", 0.0))
             except:
@@ -189,7 +210,6 @@ async def fetch_coins():
                 "quoteVolume": qvol,
                 "baseVolume": base_vol
             })
-
     except Exception as e:
         print(f"[{datetime.now()}] ❌ Error fetching Binance tickers: {e}")
 
@@ -201,7 +221,7 @@ async def fetch_coins():
 async def post_signal(c):
     """
     Post message to CHANNEL_ID and store metadata in Upstash.
-    Supports multiple reposts and tracks original timestamps.
+    Keeps historical msg_ids for appending replies later.
     """
     symbol = c["symbol"].upper()
     full_symbol = c["full_symbol"]
@@ -252,7 +272,7 @@ async def post_signal(c):
             "msg_ids": [{"msg_id": msg_id, "posted_at": now_iso}],
             "symbol": symbol,
             "full_symbol": full_symbol,
-            "coin_id": full_symbol,  # we use full_symbol as coin_id analog
+            "coin_id": full_symbol,  # use full_symbol as the id analog
             "buy_price": price,
             "sell_targets": sells,
             "posted_at": now_iso,
@@ -263,7 +283,7 @@ async def post_signal(c):
         print(f"[{datetime.now()}] ✅ Posted and tracked {symbol} (msg_id={msg_id})")
 
 # -----------------------------
-# SCAN AND POST PRE-PUMP COINS (main scanner logic)
+# SCAN AND POST PRE-PUMP COINS (main scanner logic) — Advanced Klines (B)
 # -----------------------------
 async def scan_and_post(auto=False):
     coins = await fetch_coins()  # Binance USDT coins only
@@ -275,24 +295,23 @@ async def scan_and_post(auto=False):
         if is_stable(symbol):
             continue
 
-        # Skip coins with tiny USDT quote volume (day)
-        if float(c.get("quoteVolume", 0.0)) < 100:  # skip extremely low 24h volume
+        # Filter by daily quote volume to avoid many tiny coins
+        if float(c.get("quoteVolume", 0.0)) < 100.0:
             continue
 
-        # Fetch last 15 minutes klines (1m)
+        # Fetch last 15 1-minute klines
         try:
             params = {"symbol": full_symbol, "interval": "1m", "limit": 15}
             klines = binance_get("/api/v3/klines", params=params)
             if not klines or len(klines) < 3:
                 continue
 
-            # klines: [ [openTime, open, high, low, close, volume, closeTime, quoteAssetVolume, ...], ... ]
+            # Parse klines: [openTime, open, high, low, close, volume, closeTime, quoteAssetVolume, ...]
             prices = [float(k[4]) for k in klines]  # close prices
             quote_volumes = [float(k[7]) for k in klines]  # quote asset volume (USDT)
 
             price_now = float(c.get("current_price") or prices[-1])
             price_earlier = float(prices[0])
-            # protect against zero
             if price_earlier <= 0:
                 continue
             change_short = ((price_now - price_earlier) / price_earlier) * 100.0
@@ -312,7 +331,6 @@ async def scan_and_post(auto=False):
         volume_spike_threshold = 1.5    # volume must increase 1.5x
         price_change_threshold = 0.5    # price up at least 0.5%
 
-        # skip tiny dead coins with almost no liquidity
         if volume_now < min_volume_absolute:
             continue
 
@@ -339,7 +357,7 @@ async def scan_and_post(auto=False):
             print(f"[{datetime.now()}] ❌ Failed to notify admin: {e}")
         return
 
-    # Only post top candidate (append if already exists)
+    # Post top candidate (append if already exists)
     coin = candidates[0]
     await post_signal(coin)
 
@@ -368,11 +386,10 @@ async def tp_watcher_loop(poll_interval=60):
                         pass
 
                 full_symbol = data.get("full_symbol") or (symbol + "USDT")
-                coin_id = full_symbol
-                if not coin_id:
+                if not full_symbol:
                     continue
 
-                # fetch current price (Binance)
+                # fetch current price via private key header
                 try:
                     price_resp = binance_get("/api/v3/ticker/price", params={"symbol": full_symbol})
                     if not price_resp:
@@ -430,7 +447,7 @@ async def tp_watcher_loop(poll_interval=60):
                         except:
                             original_msg_id = messages[-1]["msg_id"]
 
-                    # send TP message
+                    # send TP message as reply (if possible)
                     if original_msg_id:
                         try:
                             await client.send_message(CHANNEL_ID, msg, reply_to=original_msg_id)
@@ -463,14 +480,14 @@ async def monthly_cleanup_loop():
             next_day = now + timedelta(days=1)
             if next_day.day == 1:  # tomorrow is the first day of next month
                 print(f"[{datetime.now()}] 🧹 Monthly cleanup running...")
-
+                
                 symbols = upstash_smembers("active_signals") or []
                 for symbol in symbols:
                     upstash_del(f"signal:{symbol}")
                     upstash_srem_setname("active_signals", symbol)
-
+                
                 print(f"[{datetime.now()}] ✅ Monthly cleanup done for {len(symbols)} signals.")
-
+            
             # Sleep 61 seconds to avoid double run in same minute
             await asyncio.sleep(61)
         else:
@@ -486,17 +503,75 @@ async def manual_trigger(event):
     if user_id != ADMIN_ID:
         await event.reply("❌ You are not authorized.")
         return
-    await event.reply("⏳ Manual scan started — checking 1 coin only...")
-    await scan_and_post(auto=False)
-    await event.reply("✅ Manual scan completed.")
+
+    # Allow /signal SYMBOL (e.g. /signal PEPEUSDT) or plain manual scan if no arg
+    text = event.raw_text.strip().split()
+    if len(text) >= 2:
+        full_symbol = text[1].upper()
+        if not full_symbol.endswith("USDT"):
+            full_symbol = full_symbol + "USDT"
+
+        await event.reply(f"⏳ Manual scan for {full_symbol} — fetching klines...")
+        # Build a temporary coin dict and directly post signal if passes filters
+        try:
+            # Get 24hr info to populate current_price/quoteVolume
+            info = binance_get("/api/v3/ticker/24hr", params={"symbol": full_symbol})
+            if not info:
+                return await event.reply("❌ Binance returned no info for that symbol.")
+
+            coin = {
+                "symbol": full_symbol[:-4],
+                "full_symbol": full_symbol,
+                "current_price": float(info.get("lastPrice", info.get("price", 0))),
+                "quoteVolume": float(info.get("quoteVolume", 0)),
+                "baseVolume": float(info.get("volume", 0))
+            }
+
+            # Fetch klines and run the same checks as auto-scan
+            params = {"symbol": full_symbol, "interval": "1m", "limit": 15}
+            klines = binance_get("/api/v3/klines", params=params)
+            if not klines or len(klines) < 3:
+                return await event.reply("❌ Not enough klines to analyze.")
+
+            prices = [float(k[4]) for k in klines]
+            quote_volumes = [float(k[7]) for k in klines]
+            price_now = coin["current_price"] or prices[-1]
+            price_earlier = prices[0]
+            change_short = ((price_now - price_earlier) / (price_earlier + 1e-12)) * 100.0
+            volume_now = quote_volumes[-1]
+            volume_earlier = quote_volumes[0] + 1e-9
+            volume_spike = volume_now / volume_earlier
+
+            # Thresholds
+            if volume_now < 500 or volume_spike < 1.5 or change_short < 0.5:
+                await event.reply(f"❌ {full_symbol} did not pass pre-pump filters.\nchange={change_short:.3f}% vol_min={volume_now:.2f} spike={volume_spike:.2f}")
+                return
+
+            # Passed: post signal
+            await post_signal(coin)
+            await event.reply("✅ Manual signal posted.")
+        except Exception as e:
+            print(f"[{datetime.now()}] ❌ Manual trigger error: {e}")
+            await event.reply("❌ Error during manual scan.")
+    else:
+        # No symbol provided: run a single coin scan (same as old behaviour)
+        await event.reply("⏳ Manual scan started — checking 1 coin only...")
+        await scan_and_post(auto=False)
+        await event.reply("✅ Manual scan completed.")
 
 # -----------------------------
 # AUTO SCAN LOOP (every 10 minutes)
 # -----------------------------
 async def auto_scan_loop():
+    """
+    Uses advanced klines detector and posts top candidate every 10 minutes.
+    """
     while True:
         print(f"[{datetime.now()}] 🔍 Auto scan running...")
-        await scan_and_post(auto=True)
+        try:
+            await scan_and_post(auto=True)
+        except Exception as e:
+            print(f"[{datetime.now()}] ❌ Auto scan exception: {e}")
         await asyncio.sleep(600)  # 10 minutes
 
 # -----------------------------
@@ -504,8 +579,8 @@ async def auto_scan_loop():
 # -----------------------------
 async def main():
     await client.start(bot_token=BOT_TOKEN)
-    print("✅ Pre-Pump Scanner Bot is live (Binance mode)")
-    # start TP watcher background tasks
+    print("✅ Pre-Pump Scanner Bot is live (Binance private API only)")
+    # start background tasks
     asyncio.create_task(tp_watcher_loop(poll_interval=60))
     asyncio.create_task(auto_scan_loop())
     asyncio.create_task(monthly_cleanup_loop())
