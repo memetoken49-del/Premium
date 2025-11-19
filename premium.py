@@ -199,35 +199,34 @@ async def post_signal(symbol_short: str, price: float):
     print(f"[{datetime.now()}] ✅ Posted signal {symbol} at {price}")
 
 # -----------------------------
-# WEBSOCKET MONITOR (robust)
+# WEBSOCKET MONITOR (robust, fixed USDT filter)
 # -----------------------------
 async def monitor_trades_loop(client_ws: AsyncClient):
     """
     Create multiplex trade streams for all USDT pairs and process messages using recv().
-    This function auto-reconnects on exceptions.
+    Auto-reconnects on exceptions.
     """
     print(f"[{datetime.now()}] 🔌 Starting WebSocket monitor loop")
     bsm = BinanceSocketManager(client_ws)
 
-    # Build stream list once; if it fails, retry gracefully.
     while True:
         try:
             info = await client_ws.get_all_tickers()  # single REST call on startup
-            usdt_symbols = [t['symbol'] for t in info if t['symbol'].endswith("USDT") and not is_stable(t['symbol'])]
+            # Fixed USDT filter: include only pairs ending with USDT
+            usdt_symbols = [t['symbol'] for t in info if t['symbol'].endswith("USDT")]
             if not usdt_symbols:
                 print(f"[{datetime.now()}] ⚠️ No USDT symbols found; retrying in 10s")
                 await asyncio.sleep(10)
                 continue
 
             streams = [f"{s.lower()}@trade" for s in usdt_symbols]
-            print(f"[{datetime.now()}] 🟢 Subscribing to {len(streams)} trade streams (multiplex)")
+            print(f"[{datetime.now()}] 🟢 Subscribing to {len(streams)} USDT trade streams (multiplex)")
 
-            # multiplex socket (ReconnectingWebsocket-like object) - use recv() to read messages
             async with bsm.multiplex_socket(streams) as ms:
                 print(f"[{datetime.now()}] 🟢 WebSocket multiplex connected")
                 while True:
                     try:
-                        msg = await ms.recv()  # <- correct pattern (no async for)
+                        msg = await ms.recv()
                         if not msg:
                             await asyncio.sleep(0.01)
                             continue
@@ -237,25 +236,21 @@ async def monitor_trades_loop(client_ws: AsyncClient):
                         if not data:
                             continue
 
-                        # For trade stream, data contains 's','p','q'
                         symbol_full = data.get("s")
-                        if not symbol_full:
-                            continue
-                        if is_stable(symbol_full):
-                            continue
-
                         price = float(data.get("p", 0))
                         qty = float(data.get("q", 0))
                         trade_value = price * qty
 
-                        # quick filter: ignore tiny trades
+                        # Quick filter: ignore tiny trades
                         if trade_value < MIN_TRADE_USD:
                             continue
 
-                        # short symbol like BTC if symbol_full is BTCUSDT
                         symbol_short = symbol_full.replace("USDT", "")
 
-                        # maintain sliding window
+                        # Debug print to confirm live trades
+                        print(f"[{datetime.now()}] 🔹 Trade: {symbol_short} price={price} qty={qty} value={trade_value:.2f}")
+
+                        # Maintain sliding window
                         state = symbol_state.get(symbol_short)
                         if state is None:
                             state = {
@@ -264,31 +259,23 @@ async def monitor_trades_loop(client_ws: AsyncClient):
                                 "last_volume": qty
                             }
                             symbol_state[symbol_short] = state
-
                         state["trades"].append({"price": price, "qty": qty})
-                        trades = state["trades"]
 
-                        # aggregated metrics
+                        # Aggregated metrics
+                        trades = state["trades"]
                         volume_now = sum(t['price'] * t['qty'] for t in trades)
                         price_now = (sum(t['price'] for t in trades) / len(trades)) if trades else price
-
-                        # compute spike vs previous short period
                         prev_volume = state.get("last_volume", 1.0)
                         prev_price = state.get("last_avg_price", price_now)
 
                         volume_spike = volume_now / (prev_volume + 1e-9)
                         price_change = ((price_now - prev_price) / (prev_price + 1e-9)) * 100
 
-                        # update last values for next comparison
                         state["last_volume"] = volume_now
                         state["last_avg_price"] = price_now
 
-                        # Debug occasional:
-                        # print(f"{symbol_short} vol_spike={volume_spike:.2f} price_chg={price_change:.3f}% tv={trade_value:.2f}")
-
                         # Trigger pre-pump detection
                         if volume_spike >= VOLUME_SPIKE_THRESHOLD and price_change >= PRICE_CHANGE_THRESHOLD:
-                            # To avoid duplicate posts in a short period, check if a signal exists and is recent
                             existing = upstash_get(f"signal:{symbol_short}")
                             if existing:
                                 try:
@@ -298,23 +285,20 @@ async def monitor_trades_loop(client_ws: AsyncClient):
                                     existing = {}
                                 posted_at = existing.get("posted_at")
                                 if posted_at:
-                                    # if posted within last 10 minutes, skip to avoid duplicates
                                     try:
                                         dt = datetime.fromisoformat(posted_at)
                                         if (datetime.now(timezone.utc) - dt).total_seconds() < 600:
                                             continue
                                     except:
                                         pass
-                            # Post signal (async)
                             asyncio.create_task(post_signal(symbol_short, price_now))
 
-                        # store last_price for TP watcher (update cache frequently)
                         upstash_set(f"last_price:{symbol_short}", {"price": price, "updated_at": datetime.now(timezone.utc).isoformat()})
 
                     except Exception as inner_e:
                         print(f"[{datetime.now()}] ⚠️ WebSocket message handling error: {inner_e}")
-                        # brief backoff to avoid tight loop on repeated parse errors
                         await asyncio.sleep(0.5)
+
         except Exception as outer_e:
             print(f"[{datetime.now()}] ❌ WebSocket monitor outer error: {outer_e} — reconnecting in 3s")
             await asyncio.sleep(3)
