@@ -2,4 +2,4 @@ Flask
 requests
 telethon
 python-binance
-ujson
+
