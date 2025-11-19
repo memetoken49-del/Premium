@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# premium.py - WebSocket pre-pump scanner (Full, fixed)
+# premium_full.py - Robust Pre-Pump Scanner Bot
+
 import os
 import asyncio
 import threading
@@ -50,18 +51,15 @@ def self_ping():
         try:
             url = os.environ.get("RENDER_URL")
             if url:
-                try:
-                    requests.get(url, timeout=10)
-                except Exception as e:
-                    print(f"[{datetime.now()}] ❌ Self-ping error: {e}")
-                else:
-                    print(f"[{datetime.now()}] 🔁 Self-ping to {url}")
+                try: requests.get(url, timeout=10)
+                except Exception as e: print(f"[{datetime.now()}] ❌ Self-ping error: {e}")
+                else: print(f"[{datetime.now()}] 🔁 Self-ping to {url}")
         except Exception as e:
             print(f"[{datetime.now()}] ❌ Self-ping outer error: {e}")
         time.sleep(240)
 
 # -----------------------------
-# UPSTASH HELPERS (synchronous HTTP)
+# UPSTASH HELPERS
 # -----------------------------
 UP_HEADERS = {"Authorization": f"Bearer {UPSTASH_REDIS_TOKEN}"}
 
@@ -128,12 +126,11 @@ STABLECOINS = ["USDT", "BUSD", "USDC", "DAI", "TUSD"]
 MIN_TRADE_USD = 500.0
 VOLUME_SPIKE_THRESHOLD = 1.5
 PRICE_CHANGE_THRESHOLD = 0.5  # percent
-TRADE_WINDOW_SIZE = 30  # number of recent trades to aggregate
+TRADE_WINDOW_SIZE = 30
 
-symbol_state = {}  # in-memory short-term state: symbol -> {trades deque, last_avg_price, last_volume}
+symbol_state = {}  # symbol -> {trades deque, last_avg_price, last_volume}
 
 def is_stable(symbol: str) -> bool:
-    """Detect stablecoin pairs (symbol like BTCUSDT)."""
     for sc in STABLECOINS:
         if symbol.endswith(sc):
             return True
@@ -147,10 +144,9 @@ def calculate_buy_sell_zones(price: float):
     return buy_zone_1, buy_zone_2, sell_zones
 
 # -----------------------------
-# SIGNAL POSTING (telegram + upstash)
+# SIGNAL POSTING
 # -----------------------------
 async def post_signal(symbol_short: str, price: float):
-    """Post to Telegram and store signal in Upstash."""
     symbol = symbol_short.upper()
     key = f"signal:{symbol}"
     buy1, buy2, sells = calculate_buy_sell_zones(price)
@@ -173,142 +169,98 @@ async def post_signal(symbol_short: str, price: float):
         "posted_by": "bot"
     }
 
-    # save/append
     existing = upstash_get(key)
     if existing:
         try:
-            if isinstance(existing, str):
-                existing = json.loads(existing)
-        except:
-            existing = {}
+            if isinstance(existing, str): existing = json.loads(existing)
+        except: existing = {}
         msg_ids = existing.get("msg_ids", [])
         msg_ids.append({"msg_id": msg_id, "posted_at": now_iso})
-        existing.update({
-            "msg_ids": msg_ids,
-            "buy_price": price,
-            "sell_targets": sells,
-            "posted_at": now_iso
-        })
+        existing.update({"msg_ids": msg_ids, "buy_price": price, "sell_targets": sells, "posted_at": now_iso})
         upstash_set(key, existing)
     else:
         upstash_set(key, payload)
         upstash_sadd_setname("active_signals", symbol)
 
-    # also cache last_price for TP watcher
     upstash_set(f"last_price:{symbol}", {"price": price, "updated_at": now_iso})
     print(f"[{datetime.now()}] ✅ Posted signal {symbol} at {price}")
 
 # -----------------------------
-# WEBSOCKET MONITOR (robust, fixed USDT filter)
+# ROBUST WEBSOCKET MONITOR
 # -----------------------------
 async def monitor_trades_loop(client_ws: AsyncClient):
-    """
-    Create multiplex trade streams for all USDT pairs and process messages using recv().
-    Auto-reconnects on exceptions.
-    """
-    print(f"[{datetime.now()}] 🔌 Starting WebSocket monitor loop")
-    bsm = BinanceSocketManager(client_ws)
-
+    print(f"[{datetime.now()}] 🔌 Starting WebSocket monitor")
     while True:
         try:
-            info = await client_ws.get_all_tickers()  # single REST call on startup
-            # Fixed USDT filter: include only pairs ending with USDT
-            usdt_symbols = [t['symbol'] for t in info if t['symbol'].endswith("USDT")]
+            info = await client_ws.get_all_tickers()
+            usdt_symbols = [t['symbol'] for t in info if t['symbol'].endswith("USDT") and not is_stable(t['symbol'])]
             if not usdt_symbols:
                 print(f"[{datetime.now()}] ⚠️ No USDT symbols found; retrying in 10s")
                 await asyncio.sleep(10)
                 continue
 
             streams = [f"{s.lower()}@trade" for s in usdt_symbols]
-            print(f"[{datetime.now()}] 🟢 Subscribing to {len(streams)} USDT trade streams (multiplex)")
-
-            async with bsm.multiplex_socket(streams) as ms:
+            async with BinanceSocketManager(client_ws).multiplex_socket(streams) as ms:
                 print(f"[{datetime.now()}] 🟢 WebSocket multiplex connected")
                 while True:
                     try:
                         msg = await ms.recv()
-                        if not msg:
+                        if not msg: 
                             await asyncio.sleep(0.01)
                             continue
-
-                        # multiplex returns {'stream': 'btcusdt@trade', 'data': {...}}
-                        data = msg.get("data") or msg.get("result") or msg
-                        if not data:
-                            continue
-
+                        data = msg.get("data") or msg
                         symbol_full = data.get("s")
+                        if not symbol_full or is_stable(symbol_full):
+                            continue
                         price = float(data.get("p", 0))
                         qty = float(data.get("q", 0))
                         trade_value = price * qty
-
-                        # Quick filter: ignore tiny trades
-                        if trade_value < MIN_TRADE_USD:
-                            continue
+                        if trade_value < MIN_TRADE_USD: continue
 
                         symbol_short = symbol_full.replace("USDT", "")
-
-                        # Debug print to confirm live trades
-                        print(f"[{datetime.now()}] 🔹 Trade: {symbol_short} price={price} qty={qty} value={trade_value:.2f}")
-
-                        # Maintain sliding window
                         state = symbol_state.get(symbol_short)
                         if state is None:
-                            state = {
-                                "trades": deque(maxlen=TRADE_WINDOW_SIZE),
-                                "last_avg_price": price,
-                                "last_volume": qty
-                            }
+                            state = {"trades": deque(maxlen=TRADE_WINDOW_SIZE), "last_avg_price": price, "last_volume": qty}
                             symbol_state[symbol_short] = state
                         state["trades"].append({"price": price, "qty": qty})
 
-                        # Aggregated metrics
                         trades = state["trades"]
-                        volume_now = sum(t['price'] * t['qty'] for t in trades)
-                        price_now = (sum(t['price'] for t in trades) / len(trades)) if trades else price
+                        volume_now = sum(t['price']*t['qty'] for t in trades)
+                        price_now = sum(t['price'] for t in trades)/len(trades) if trades else price
                         prev_volume = state.get("last_volume", 1.0)
                         prev_price = state.get("last_avg_price", price_now)
-
                         volume_spike = volume_now / (prev_volume + 1e-9)
-                        price_change = ((price_now - prev_price) / (prev_price + 1e-9)) * 100
-
+                        price_change = ((price_now - prev_price)/(prev_price+1e-9))*100
                         state["last_volume"] = volume_now
                         state["last_avg_price"] = price_now
 
-                        # Trigger pre-pump detection
-                        if volume_spike >= VOLUME_SPIKE_THRESHOLD and price_change >= PRICE_CHANGE_THRESHOLD:
+                        if volume_spike>=VOLUME_SPIKE_THRESHOLD and price_change>=PRICE_CHANGE_THRESHOLD:
                             existing = upstash_get(f"signal:{symbol_short}")
+                            recent_posted = False
                             if existing:
                                 try:
-                                    if isinstance(existing, str):
-                                        existing = json.loads(existing)
-                                except:
-                                    existing = {}
-                                posted_at = existing.get("posted_at")
-                                if posted_at:
-                                    try:
-                                        dt = datetime.fromisoformat(posted_at)
-                                        if (datetime.now(timezone.utc) - dt).total_seconds() < 600:
-                                            continue
-                                    except:
-                                        pass
-                            asyncio.create_task(post_signal(symbol_short, price_now))
+                                    if isinstance(existing,str): existing=json.loads(existing)
+                                    posted_at = existing.get("posted_at")
+                                    if posted_at:
+                                        dt=datetime.fromisoformat(posted_at)
+                                        if (datetime.now(timezone.utc)-dt).total_seconds()<600: recent_posted=True
+                                except: pass
+                            if not recent_posted: asyncio.create_task(post_signal(symbol_short, price_now))
 
-                        upstash_set(f"last_price:{symbol_short}", {"price": price, "updated_at": datetime.now(timezone.utc).isoformat()})
-
-                    except Exception as inner_e:
-                        print(f"[{datetime.now()}] ⚠️ WebSocket message handling error: {inner_e}")
+                        upstash_set(f"last_price:{symbol_short}", {"price": price_now, "updated_at": datetime.now(timezone.utc).isoformat()})
+                    
+                    except Exception as e:
+                        print(f"[{datetime.now()}] ⚠️ WebSocket message error: {e}")
                         await asyncio.sleep(0.5)
-
-        except Exception as outer_e:
-            print(f"[{datetime.now()}] ❌ WebSocket monitor outer error: {outer_e} — reconnecting in 3s")
+        except Exception as e:
+            print(f"[{datetime.now()}] ❌ WebSocket outer error: {e} — reconnecting in 3s")
             await asyncio.sleep(3)
-            continue
 
 # -----------------------------
-# TP WATCHER LOOP (uses upstash last_price cache)
+# TP WATCHER LOOP
 # -----------------------------
 async def tp_watcher_loop(poll_interval=60):
-    print(f"[{datetime.now()}] ⏱ TP watcher started (poll {poll_interval}s)")
+    print(f"[{datetime.now()}] ⏱ TP watcher started")
     while True:
         try:
             symbols = upstash_smembers("active_signals") or []
@@ -318,92 +270,78 @@ async def tp_watcher_loop(poll_interval=60):
                 if not data:
                     upstash_srem_setname("active_signals", symbol)
                     continue
-                if isinstance(data, str):
-                    try: data = json.loads(data)
-                    except: data = {}
+                if isinstance(data,str):
+                    try:data=json.loads(data)
+                    except: data={}
                 lp = upstash_get(f"last_price:{symbol}")
-                if lp and isinstance(lp, dict):
-                    try:
-                        current_price = float(lp.get("price"))
-                    except:
-                        continue
-                else:
-                    # fallback: skip if no cached price
-                    continue
-
-                buy_price = float(data.get("buy_price", 0))
-                sell_targets = data.get("sell_targets", []) or []
-                hit_index = None
-                for idx, t in enumerate(sell_targets):
-                    if current_price >= float(t):
-                        hit_index = idx
+                if lp and isinstance(lp,dict):
+                    try: current_price=float(lp.get("price"))
+                    except: continue
+                else: continue
+                buy_price=float(data.get("buy_price",0))
+                sell_targets=data.get("sell_targets",[]) or []
+                hit_index=None
+                for idx,t in enumerate(sell_targets):
+                    if current_price>=float(t):
+                        hit_index=idx
                         break
-
                 if hit_index is not None:
-                    profit_pct = ((float(sell_targets[hit_index]) - buy_price) / buy_price) * 100 * 3.0
-                    posted_at = data.get("posted_at")
-                    # calculate period
-                    period_str = "N/A"
+                    profit_pct=((float(sell_targets[hit_index])-buy_price)/buy_price)*100*3.0
+                    posted_at=data.get("posted_at")
+                    period_str="N/A"
                     try:
-                        posted_dt = datetime.fromisoformat(posted_at)
-                        delta = datetime.now(timezone.utc) - posted_dt
-                        hours, rem = divmod(int(delta.total_seconds()), 3600)
-                        minutes, _ = divmod(rem, 60)
-                        period_str = f"{hours} Hours {minutes} Minutes"
-                    except:
-                        pass
-
-                    msg = f"#{symbol}/USDT Take-Profit target {hit_index+1} ✅\nProfit: {profit_pct:.4f}% 📈\nPeriod: {period_str} ⏰\n"
-                    # Try to reply to the original post (if msg_id exists)
+                        posted_dt=datetime.fromisoformat(posted_at)
+                        delta=datetime.now(timezone.utc)-posted_dt
+                        hours,rem=divmod(int(delta.total_seconds()),3600)
+                        minutes,_=divmod(rem,60)
+                        period_str=f"{hours} Hours {minutes} Minutes"
+                    except: pass
+                    msg=f"#{symbol}/USDT Take-Profit target {hit_index+1} ✅\nProfit: {profit_pct:.4f}% 📈\nPeriod: {period_str} ⏰\n"
                     try:
-                        msgs = data.get("msg_ids", [])
-                        original_msg_id = None
-                        if msgs:
-                            original_msg_id = msgs[-1].get("msg_id")
+                        msgs=data.get("msg_ids",[])
+                        original_msg_id=None
+                        if msgs: original_msg_id=msgs[-1].get("msg_id")
                         if original_msg_id:
-                            await tg_client.send_message(CHANNEL_ID, msg, reply_to=original_msg_id)
-                        else:
-                            await tg_client.send_message(CHANNEL_ID, msg)
+                            await tg_client.send_message(CHANNEL_ID,msg,reply_to=original_msg_id)
+                        else: await tg_client.send_message(CHANNEL_ID,msg)
                     except Exception as e:
-                        print(f"[{datetime.now()}] ❌ Failed to send TP msg for {symbol}: {e}")
-
-                    # update/remove targets
-                    new_targets = sell_targets[hit_index+1:]
+                        print(f"[{datetime.now()}] ❌ Failed TP msg for {symbol}: {e}")
+                    new_targets=sell_targets[hit_index+1:]
                     if new_targets:
-                        data["sell_targets"] = new_targets
-                        upstash_set(key, data)
+                        data["sell_targets"]=new_targets
+                        upstash_set(key,data)
                     else:
-                        upstash_srem_setname("active_signals", symbol)
+                        upstash_srem_setname("active_signals",symbol)
                         upstash_del(key)
         except Exception as e:
             print(f"[{datetime.now()}] ❌ TP watcher error: {e}")
         await asyncio.sleep(poll_interval)
 
 # -----------------------------
-# AUTO CLEAN: remove signals older than 30 days
+# CLEANUP LOOP
 # -----------------------------
 async def cleanup_old_signals_loop(poll_interval=3600):
-    print(f"[{datetime.now()}] 🧹 Auto-clean loop started (every {poll_interval}s)")
+    print(f"[{datetime.now()}] 🧹 Auto-clean loop started")
     while True:
         try:
             symbols = upstash_smembers("active_signals") or []
-            now = datetime.now(timezone.utc)
+            now=datetime.now(timezone.utc)
             for symbol in symbols:
-                key = f"signal:{symbol}"
-                data = upstash_get(key)
+                key=f"signal:{symbol}"
+                data=upstash_get(key)
                 if not data:
-                    upstash_srem_setname("active_signals", symbol)
+                    upstash_srem_setname("active_signals",symbol)
                     continue
-                if isinstance(data, str):
-                    try: data = json.loads(data)
-                    except: data = {}
-                posted_at = data.get("posted_at")
+                if isinstance(data,str):
+                    try:data=json.loads(data)
+                    except: data={}
+                posted_at=data.get("posted_at")
                 if posted_at:
                     try:
-                        posted_dt = datetime.fromisoformat(posted_at)
-                        if (now - posted_dt) >= timedelta(days=30):
+                        posted_dt=datetime.fromisoformat(posted_at)
+                        if (now-posted_dt)>=timedelta(days=30):
                             upstash_del(key)
-                            upstash_srem_setname("active_signals", symbol)
+                            upstash_srem_setname("active_signals",symbol)
                             print(f"[{datetime.now()}] 🧹 Auto-cleaned {symbol} after 30 days")
                     except Exception as e:
                         print(f"[{datetime.now()}] ❌ Auto-clean parse error for {symbol}: {e}")
@@ -412,47 +350,38 @@ async def cleanup_old_signals_loop(poll_interval=3600):
         await asyncio.sleep(poll_interval)
 
 # -----------------------------
-# Manual /signal command
+# MANUAL /signal COMMAND
 # -----------------------------
 @tg_client.on(events.NewMessage(pattern="/signal"))
 async def manual_trigger(event):
-    if event.sender_id != ADMIN_ID:
+    if event.sender_id!=ADMIN_ID:
         await event.reply("❌ You are not authorized.")
         return
     await event.reply("⏳ Manual scan acknowledged — monitoring live WebSocket feed.")
-    # Optionally, we could run a short manual aggregation pass over symbol_state and post top candidates.
-    # For safety, we only notify admin here.
     await event.reply("✅ Manual trigger done.")
 
 # -----------------------------
-# STARTUP / MAIN
+# MAIN STARTUP
 # -----------------------------
 async def main():
-    # start Telegram client
     await tg_client.start(bot_token=BOT_TOKEN)
     print(f"[{datetime.now()}] ✅ Telegram client started")
-
-    # create Async Binance client
-    client_ws = await AsyncClient.create(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+    client_ws=await AsyncClient.create(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
     print(f"[{datetime.now()}] ✅ Binance AsyncClient created")
 
-    # spawn background tasks
     asyncio.create_task(monitor_trades_loop(client_ws))
-    asyncio.create_task(tp_watcher_loop(poll_interval=60))
-    asyncio.create_task(cleanup_old_signals_loop(poll_interval=3600))
+    asyncio.create_task(tp_watcher_loop())
+    asyncio.create_task(cleanup_old_signals_loop())
 
-    print(f"[{datetime.now()}] 🟢 Bot fully started — listening for pumps")
+    print(f"[{datetime.now()}] 🟢 Bot fully started")
     await tg_client.run_until_disconnected()
 
 # -----------------------------
 # ENTRYPOINT
 # -----------------------------
-if __name__ == "__main__":
-    # run Flask and self-ping in daemon threads
+if __name__=="__main__":
     threading.Thread(target=run_web, daemon=True).start()
     threading.Thread(target=self_ping, daemon=True).start()
-
-    # run async main
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
