@@ -98,6 +98,9 @@ VOLUME_SPIKE_THRESHOLD = float(os.getenv("VOLUME_SPIKE_THRESHOLD", "1.5"))
 PRICE_CHANGE_THRESHOLD = float(os.getenv("PRICE_CHANGE_THRESHOLD", "0.5"))
 TRADE_WINDOW_SIZE = int(os.getenv("TRADE_WINDOW_SIZE", "30"))
 
+MAX_SIGNALS_PER_DAY = 10
+SIGNAL_WINDOW_HOURS = 24  # Don't repeat same coin within 24h
+
 symbol_state = {}  # symbol -> {trades deque, last_avg_price, last_volume}
 
 def calculate_buy_sell_zones(price: float):
@@ -110,8 +113,26 @@ def calculate_buy_sell_zones(price: float):
 # -----------------------------
 # SIGNAL POSTING
 # -----------------------------
+async def can_post_signal(symbol):
+    signals_today = await upstash_smembers("signals_today") or []
+    if len(signals_today) >= MAX_SIGNALS_PER_DAY:
+        return False
+    key = f"last_signal:{symbol}"
+    last = await upstash_get(key)
+    if last:
+        try:
+            dt = datetime.fromisoformat(last)
+            if (datetime.now(timezone.utc) - dt).total_seconds() < SIGNAL_WINDOW_HOURS * 3600:
+                return False
+        except: pass
+    return True
+
 async def post_signal(symbol_short, price):
     symbol = symbol_short.upper()
+    if not await can_post_signal(symbol):
+        print(f"[{datetime.now()}] ⚠️ Skipped signal {symbol} (already posted or max reached)")
+        return
+
     key = f"signal:{symbol}"
     buy1, buy2, sells = calculate_buy_sell_zones(price)
     msg = f"🚀 Binance\n#{symbol}/USDT\nBuy zone {buy1}-{buy2}\nSell zone {' - '.join([str(sz) for sz in sells])}\nMargin 3x"
@@ -141,8 +162,22 @@ async def post_signal(symbol_short, price):
     else:
         await upstash_set(key, payload)
         await upstash_sadd("active_signals", symbol)
+
     await upstash_set(f"last_price:{symbol}", {"price": price, "updated_at": now_iso})
+    await upstash_set(f"last_signal:{symbol}", now_iso)
+    await upstash_sadd("signals_today", symbol)
     print(f"[{datetime.now()}] ✅ Posted signal {symbol} at {price}")
+
+# -----------------------------
+# RESET DAILY SIGNALS AT MIDNIGHT UTC
+# -----------------------------
+async def reset_daily_signals_loop():
+    while True:
+        now = datetime.now(timezone.utc)
+        seconds_until_midnight = ((24 - now.hour - 1)*3600 + (60 - now.minute - 1)*60 + (60 - now.second))
+        await asyncio.sleep(seconds_until_midnight + 1)
+        await upstash_set("signals_today", [])  # clear daily counter
+        print(f"[{datetime.now()}] 🔄 Daily signal counter reset")
 
 # -----------------------------
 # DYNAMIC POLL INTERVAL
@@ -183,17 +218,7 @@ async def poll_prices_loop(client_ws):
                 state["last_volume"]=volume_now
                 state["last_avg_price"]=price_now
                 if volume_spike>=VOLUME_SPIKE_THRESHOLD and price_change>=PRICE_CHANGE_THRESHOLD:
-                    existing = await upstash_get(f"signal:{symbol}")
-                    recent_posted=False
-                    if existing:
-                        try:
-                            if isinstance(existing,str): existing=json.loads(existing)
-                            posted_at = existing.get("posted_at")
-                            if posted_at:
-                                dt = datetime.fromisoformat(posted_at)
-                                if (datetime.now(timezone.utc)-dt).total_seconds()<600: recent_posted=True
-                        except: recent_posted=False
-                    if not recent_posted: asyncio.create_task(post_signal(symbol,price_now))
+                    asyncio.create_task(post_signal(symbol,price_now))
                 await upstash_set(f"last_price:{symbol}", {"price":price_now,"updated_at":datetime.now(timezone.utc).isoformat()})
         except Exception as e:
             print(f"[{datetime.now()}] ❌ Poll loop error: {e}")
@@ -249,6 +274,7 @@ async def main():
     client_ws = await AsyncClient.create(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
     asyncio.create_task(poll_prices_loop(client_ws))
     asyncio.create_task(tp_watcher_loop())
+    asyncio.create_task(reset_daily_signals_loop())
     await tg_client.run_until_disconnected()
 
 if __name__=="__main__":
