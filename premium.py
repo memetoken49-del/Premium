@@ -321,7 +321,7 @@ async def run_socket_batch(client_ws: AsyncClient, symbols_batch: List[str], bat
                     asyncio.create_task(process_trade_message(msg))
                 except Exception as inner:
                     print(f"[{datetime.now()}] ⚠️ Batch {batch_index} message loop error: {inner}")
-                    await asyncio.sleep(0.5)
+                    break
     except Exception as e:
         print(f"[{datetime.now()}] ❌ Socket batch {batch_index} outer error: {e} — will retry in 3s")
         await asyncio.sleep(3)
