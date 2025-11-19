@@ -330,7 +330,7 @@ async def run_socket_batch(client_ws: AsyncClient, symbols_batch: List[str], bat
 # -----------------------------
 # Monitor: start batches (calls get_all_tickers only once)
 # -----------------------------
-async def monitor_trades_ws(client_ws: AsyncClient, batch_size:int=150):
+async def monitor_trades_ws(client_ws: AsyncClient, batch_size:int=20):
     """
     Fetch USDT symbols once and spawn multiple socket batches.
     """
@@ -516,7 +516,7 @@ async def main():
     print(f"[{datetime.now()}] ✅ Binance AsyncClient created")
 
     # spawn monitor batches (monitor_trades_ws will spawn batch tasks)
-    asyncio.create_task(monitor_trades_ws(client_ws, batch_size=150))
+    asyncio.create_task(monitor_trades_ws(client_ws, batch_size=20))
     asyncio.create_task(tp_watcher_loop(poll_interval=60))
     asyncio.create_task(cleanup_old_signals_loop(poll_interval=3600))
 
