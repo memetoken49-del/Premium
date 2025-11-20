@@ -136,6 +136,8 @@ POLL_INTERVAL_SECONDS = int(24*60*60 / polls_per_day)
 # -----------------------------
 async def poll_prices_loop(client_ws):
     print(f"[{datetime.now()}] ⏱ Polling loop started (interval={POLL_INTERVAL_SECONDS}s)")
+    signal_count = 0  # Counter for throttling
+
     while True:
         try:
             tickers = await client_ws.get_all_tickers()
@@ -158,12 +160,18 @@ async def poll_prices_loop(client_ws):
                 price_change = ((price_now-prev_price)/(prev_price+1e-9))*100
                 state["last_volume"]=volume_now
                 state["last_avg_price"]=price_now
+
                 if volume_spike>=VOLUME_SPIKE_THRESHOLD and price_change>=PRICE_CHANGE_THRESHOLD:
-                    asyncio.create_task(post_signal(symbol,price_now))
+                    await post_signal(symbol, price_now)  # await to control timing
+                    signal_count += 1
+
+                    # Delay after every 7 signals
+                    if signal_count % 7 == 0:
+                        await asyncio.sleep(5)
+
         except Exception as e:
             print(f"[{datetime.now()}] ❌ Poll loop error: {e}")
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
-
 # -----------------------------
 # MAIN
 # -----------------------------
