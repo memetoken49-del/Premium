@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # premium_rest_safe_optimized.py
-# REST-only Binance Pre-Pump Scanner (Upstash + TTL, 40-minute interval)
+# REST-only Binance Pre-Pump Scanner (Upstash + TTL, 40-minute interval, Telegram channel support)
 
 import os
 import asyncio
@@ -21,6 +21,7 @@ API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+CHANNEL_ID = os.getenv("CHANNEL_ID")  # Optional: Telegram channel ID
 
 UPSTASH_REST_URL = os.getenv("UPSTASH_REST_URL", "")
 UPSTASH_TOKEN = os.getenv("UPSTASH_TOKEN", "")
@@ -38,7 +39,6 @@ client = TelegramClient('scanner_session', API_ID, API_HASH).start(bot_token=BOT
 # UPSTASH HELPERS
 # -----------------------------
 def upstash_set_sync(key, value):
-    """Supports TTL when value is a dict {value: ..., ex: seconds}"""
     try:
         if isinstance(value, dict) and "value" in value and "ex" in value:
             return requests.post(
@@ -47,7 +47,6 @@ def upstash_set_sync(key, value):
                 data=json.dumps(value),
                 timeout=10
             ).json()
-
         return requests.post(
             f"{UPSTASH_REST_URL}/set/{key}",
             headers=UP_HEADERS,
@@ -95,15 +94,13 @@ async def upstash_del(key):
 # ANTI-DUPLICATE SIGNAL (24 HOURS)
 # -----------------------------
 async def can_post_signal(symbol):
-    """Check if symbol can signal again. TTL auto-cleans old keys."""
     key = f"last_signal:{symbol}"
     last = await upstash_get(key)
 
     if not last:
-        return True  # No history → allow
+        return True
 
     try:
-        # handle TTL stored format: {"value": "...", "ex": 86400}
         if isinstance(last, dict) and "value" in last:
             last = last["value"]
 
@@ -123,15 +120,9 @@ async def mark_signal_sent(symbol):
 # BINANCE PRE-PUMP DETECTION
 # -----------------------------
 async def detect_signal(symbol, price):
-    """
-    Simple pump detection:
-    - Checks last price from Upstash
-    - If price jumps > 2% → signal
-    """
     key = f"price:{symbol}"
     last_price = await upstash_get(key)
 
-    # store initial price
     if not last_price:
         await upstash_set(key, price)
         return None
@@ -142,10 +133,7 @@ async def detect_signal(symbol, price):
         await upstash_set(key, price)
         return None
 
-    # calculate % jump
     change = 0 if last_price == 0 else ((price - last_price) / last_price) * 100
-
-    # update cache
     await upstash_set(key, price)
 
     if change >= 2.0:
@@ -163,7 +151,9 @@ async def send_signal(symbol, change, price):
         f"*Change:* `{change:.2f}%`\n"
         f"*Time:* `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
     )
-    await client.send_message(ADMIN_ID, msg, parse_mode="markdown")
+    
+    target = CHANNEL_ID or ADMIN_ID
+    await client.send_message(int(target), msg, parse_mode="markdown")
 
 # -----------------------------
 # MAIN SCANNING LOOP
@@ -182,19 +172,14 @@ async def scan_loop():
 
                 price = float(t["price"])
 
-                # detect pump
                 change = await detect_signal(symbol, price)
                 if change is None:
                     continue
 
-                # anti-duplicate (24h)
                 if not await can_post_signal(symbol):
                     continue
 
-                # send telegram message
                 await send_signal(symbol, change, price)
-
-                # mark as sent (TTL auto-expire)
                 await mark_signal_sent(symbol)
 
             await asyncio.sleep(SCAN_INTERVAL)
