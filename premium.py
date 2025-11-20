@@ -93,33 +93,90 @@ def calculate_buy_sell_zones(price: float):
     return buy_zone_1, buy_zone_2, sell_zones
 
 # -----------------------------
-# SIGNAL POSTING
+# SIGNAL POSTING (with full logging)
 # -----------------------------
-async def can_post_signal(symbol):
-    key = f"last_signal:{symbol}"
-    last = await upstash_get(key)
-    if not last: return True
-    try:
-        if isinstance(last, dict) and "value" in last: last = last["value"]
-        last_dt = datetime.fromisoformat(last)
-        if (datetime.now(timezone.utc) - last_dt).total_seconds() < REDIS_TTL_SECONDS:
-            return False
-    except: pass
-    return True
-
-async def mark_signal_sent(symbol):
-    now_iso = datetime.now(timezone.utc).isoformat()
-    await upstash_set(f"last_signal:{symbol}", {"value": now_iso, "ex": REDIS_TTL_SECONDS})
-
 async def post_signal(symbol, price):
-    if not await can_post_signal(symbol): return
-    buy1, buy2, sells = calculate_buy_sell_zones(price)
-    msg = f"🚀 Binance\n#{symbol}/USDT\nBuy zone {buy1}-{buy2}\nSell zone {' - '.join([str(sz) for sz in sells])}\nMargin 3x"
-    try: await tg_client.send_message(CHANNEL_ID, msg)
-    except: pass
-    await mark_signal_sent(symbol)
-    print(f"[{datetime.now()}] ✅ Posted signal {symbol} at {price}")
+    if not await can_post_signal(symbol):
+        print(f"[{datetime.now()}] ⏱ Signal for {symbol} blocked by TTL")
+        return
 
+    buy1, buy2, sells = calculate_buy_sell_zones(price)
+    msg = (
+        f"🚀 Binance\n"
+        f"#{symbol}/USDT\n"
+        f"Buy zone {buy1}-{buy2}\n"
+        f"Sell zone {' - '.join([str(sz) for sz in sells])}\n"
+        f"Margin 3x"
+    )
+
+    try:
+        await tg_client.send_message(CHANNEL_ID, msg)
+        print(f"[{datetime.now()}] ✅ Posted signal {symbol} at {price}")
+    except Exception as e:
+        print(f"[{datetime.now()}] ❌ Telegram send failed for {symbol}: {e}")
+
+    await mark_signal_sent(symbol)
+
+
+# -----------------------------
+# REST POLLING LOOP (full logging)
+# -----------------------------
+async def poll_prices_loop(client_ws):
+    print(f"[{datetime.now()}] ⏱ Polling loop started (interval={POLL_INTERVAL_SECONDS}s)")
+    signal_count = 0
+
+    while True:
+        try:
+            tickers = await client_ws.get_all_tickers()
+            print(f"[{datetime.now()}] ⚡ Retrieved {len(tickers)} tickers from Binance")
+
+            for t in tickers:
+                s = t.get("symbol","")
+                if not s.endswith("USDT"):
+                    continue
+
+                symbol = s.replace("USDT","")
+                price = float(t.get("price", 0))
+                state = symbol_state.get(symbol)
+
+                if state is None:
+                    state = {
+                        "trades": deque(maxlen=TRADE_WINDOW_SIZE),
+                        "last_avg_price": price,
+                        "last_volume": 1.0
+                    }
+                    symbol_state[symbol] = state
+
+                state["trades"].append({"price": price, "qty": 1.0})
+                trades = state["trades"]
+                volume_now = sum(x['price']*x['qty'] for x in trades)
+                price_now = sum(x['price'] for x in trades)/len(trades) if trades else price
+                prev_volume = state.get("last_volume", 1.0)
+                prev_price = state.get("last_avg_price", price_now)
+                volume_spike = volume_now / (prev_volume + 1e-9)
+                price_change = ((price_now - prev_price) / (prev_price + 1e-9)) * 100
+                state["last_volume"] = volume_now
+                state["last_avg_price"] = price_now
+
+                print(
+                    f"[DEBUG {datetime.now()}] {symbol}: price={price_now:.6f}, "
+                    f"volume_spike={volume_spike:.2f}, price_change={price_change:.2f}%"
+                )
+
+                if volume_spike >= VOLUME_SPIKE_THRESHOLD and price_change >= PRICE_CHANGE_THRESHOLD:
+                    await post_signal(symbol, price_now)
+                    signal_count += 1
+
+                    # Delay after every 7 signals
+                    if signal_count % 7 == 0:
+                        print(f"[{datetime.now()}] ⏳ Delay 5s after 7 signals")
+                        await asyncio.sleep(5)
+
+        except Exception as e:
+            print(f"[{datetime.now()}] ❌ Poll loop error: {e}")
+
+        print(f"[{datetime.now()}] ⏱ Poll loop sleeping for {POLL_INTERVAL_SECONDS}s")
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
 # -----------------------------
 # DYNAMIC POLL INTERVAL (≈40min)
 # -----------------------------
