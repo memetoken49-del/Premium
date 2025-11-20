@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# premium_rest_safe_optimized.py
-# REST-only Binance Pre-Pump Scanner (Upstash + TTL, 40-minute interval, Telegram channel support)
+# premium_rest_safe_ttl.py - REST-only Binance Pre-Pump Scanner (Upstash + TTL)
 
 import os
 import asyncio
@@ -8,231 +7,174 @@ import threading
 import json
 import time
 from datetime import datetime, timezone
+from collections import deque
 
 import requests
 from flask import Flask
-from telethon import TelegramClient, events
+from telethon import TelegramClient
 from binance import AsyncClient
 
 # -----------------------------
-# ENV VARIABLES
+# ENVIRONMENT VARIABLES
 # -----------------------------
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-CHANNEL_ID = os.getenv("CHANNEL_ID")  # Optional: Telegram channel ID
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
+
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 
 UPSTASH_REST_URL = os.getenv("UPSTASH_REST_URL", "")
-UPSTASH_TOKEN = os.getenv("UPSTASH_TOKEN", "")
-UP_HEADERS = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
-
-SCAN_INTERVAL = 2400  # 40 minutes in seconds
-REDIS_TTL_SECONDS = 86400  # 24 hours anti-duplicate filter
+UPSTASH_REDIS_TOKEN = os.getenv("UPSTASH_REDIS_TOKEN", "")
 
 # -----------------------------
 # TELEGRAM CLIENT
 # -----------------------------
-client = TelegramClient('scanner_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+tg_client = TelegramClient("pre_pump_session", API_ID, API_HASH)
 
 # -----------------------------
-# UPSTASH HELPERS
+# FLASK KEEP-ALIVE
 # -----------------------------
+app = Flask(__name__)
+@app.route("/")
+def home():
+    return "✅ Pre-Pump Scanner Bot Running"
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+def self_ping():
+    while True:
+        url = os.environ.get("RENDER_URL")
+        if url:
+            try: requests.get(url, timeout=10)
+            except: pass
+        time.sleep(240)
+
+# -----------------------------
+# UPSTASH HELPERS (TTL support)
+# -----------------------------
+UP_HEADERS = {"Authorization": f"Bearer {UPSTASH_REDIS_TOKEN}"}
+
 def upstash_set_sync(key, value):
+    """Supports TTL if value is dict {'value':..., 'ex':seconds}"""
     try:
-        if isinstance(value, dict) and "value" in value and "ex" in value:
-            return requests.post(
-                f"{UPSTASH_REST_URL}/set/{key}",
-                headers=UP_HEADERS,
-                data=json.dumps(value),
-                timeout=10
-            ).json()
-        return requests.post(
-            f"{UPSTASH_REST_URL}/set/{key}",
-            headers=UP_HEADERS,
-            data=json.dumps({"value": value}),
-            timeout=10
-        ).json()
-    except:
-        return {}
+        return requests.post(f"{UPSTASH_REST_URL}/set/{key}", headers=UP_HEADERS, data=json.dumps(value), timeout=12).json()
+    except: return {}
 
 def upstash_get_sync(key):
     try:
-        r = requests.get(
-            f"{UPSTASH_REST_URL}/get/{key}",
-            headers=UP_HEADERS,
-            timeout=10
-        ).json()
-        return r.get("result", None)
-    except:
-        return None
-
-def upstash_del_sync(key):
-    try:
-        return requests.delete(
-            f"{UPSTASH_REST_URL}/del/{key}",
-            headers=UP_HEADERS,
-            timeout=10
-        ).json()
-    except:
-        return {}
+        resp = requests.get(f"{UPSTASH_REST_URL}/get/{key}", headers=UP_HEADERS, timeout=12).json()
+        return resp.get("result")
+    except: return None
 
 # Async wrappers
-async def upstash_set(key, value):
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, upstash_set_sync, key, value)
-
-async def upstash_get(key):
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, upstash_get_sync, key)
-
-async def upstash_del(key):
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, upstash_del_sync, key)
+async def upstash_set(key, value): return await asyncio.to_thread(upstash_set_sync, key, value)
+async def upstash_get(key): return await asyncio.to_thread(upstash_get_sync, key)
 
 # -----------------------------
-# ANTI-DUPLICATE SIGNAL (24 HOURS)
+# FILTER / STATE
+# -----------------------------
+MIN_TRADE_USD = float(os.getenv("MIN_TRADE_USD", "500.0"))
+VOLUME_SPIKE_THRESHOLD = float(os.getenv("VOLUME_SPIKE_THRESHOLD", "1.5"))
+PRICE_CHANGE_THRESHOLD = float(os.getenv("PRICE_CHANGE_THRESHOLD", "0.5"))
+TRADE_WINDOW_SIZE = int(os.getenv("TRADE_WINDOW_SIZE", "30"))
+REDIS_TTL_SECONDS = 86400  # 24h anti-duplicate
+
+symbol_state = {}  # symbol -> {trades deque, last_avg_price, last_volume}
+
+def calculate_buy_sell_zones(price: float):
+    sell_perc = [0.05, 0.12, 0.20, 0.35, 0.55, 0.85, 1.00]
+    sell_zones = [round(price*(1+x), 6) for x in sell_perc]
+    buy_zone_1 = round(price*0.98, 6)
+    buy_zone_2 = round(price*0.995 * 1.015, 6)
+    return buy_zone_1, buy_zone_2, sell_zones
+
+# -----------------------------
+# SIGNAL POSTING
 # -----------------------------
 async def can_post_signal(symbol):
     key = f"last_signal:{symbol}"
     last = await upstash_get(key)
-
-    if not last:
-        return True
-
+    if not last: return True
     try:
-        if isinstance(last, dict) and "value" in last:
-            last = last["value"]
-
+        if isinstance(last, dict) and "value" in last: last = last["value"]
         last_dt = datetime.fromisoformat(last)
         if (datetime.now(timezone.utc) - last_dt).total_seconds() < REDIS_TTL_SECONDS:
             return False
-    except:
-        pass
-
+    except: pass
     return True
 
 async def mark_signal_sent(symbol):
     now_iso = datetime.now(timezone.utc).isoformat()
     await upstash_set(f"last_signal:{symbol}", {"value": now_iso, "ex": REDIS_TTL_SECONDS})
 
-# -----------------------------
-# BINANCE PRE-PUMP DETECTION
-# -----------------------------
-async def detect_signal(symbol, price):
-    key = f"price:{symbol}"
-    last_price = await upstash_get(key)
-
-    if not last_price:
-        await upstash_set(key, price)
-        return None
-
-    try:
-        last_price = float(last_price)
-    except:
-        await upstash_set(key, price)
-        return None
-
-    change = 0 if last_price == 0 else ((price - last_price) / last_price) * 100
-    await upstash_set(key, price)
-
-    if change >= 2.0:
-        return change
-    return None
+async def post_signal(symbol, price):
+    if not await can_post_signal(symbol): return
+    buy1, buy2, sells = calculate_buy_sell_zones(price)
+    msg = f"🚀 Binance\n#{symbol}/USDT\nBuy zone {buy1}-{buy2}\nSell zone {' - '.join([str(sz) for sz in sells])}\nMargin 3x"
+    try: await tg_client.send_message(CHANNEL_ID, msg)
+    except: pass
+    await mark_signal_sent(symbol)
+    print(f"[{datetime.now()}] ✅ Posted signal {symbol} at {price}")
 
 # -----------------------------
-# SEND SIGNAL
+# DYNAMIC POLL INTERVAL (≈40min)
 # -----------------------------
-async def send_signal(symbol, change, price):
-    msg = (
-        f"🚨 *PRE-PUMP DETECTED*\n\n"
-        f"*Symbol:* `{symbol}`\n"
-        f"*Price:* `{price}`\n"
-        f"*Change:* `{change:.2f}%`\n"
-        f"*Time:* `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
-    )
-    
-    target = CHANNEL_ID or ADMIN_ID
-    await client.send_message(int(target), msg, parse_mode="markdown")
+COINS_COUNT = 440
+UPSTASH_MONTH_LIMIT = 500_000
+DAYS_IN_MONTH = 30
+
+max_polls_month = UPSTASH_MONTH_LIMIT // COINS_COUNT
+polls_per_day = max_polls_month / DAYS_IN_MONTH
+POLL_INTERVAL_SECONDS = int(24*60*60 / polls_per_day)
 
 # -----------------------------
-# MAIN SCANNING LOOP
+# REST POLLING LOOP
 # -----------------------------
-async def scan_loop():
-    binance = await AsyncClient.create()
-
+async def poll_prices_loop(client_ws):
+    print(f"[{datetime.now()}] ⏱ Polling loop started (interval={POLL_INTERVAL_SECONDS}s)")
     while True:
         try:
-            tickers = await binance.get_ticker_price()
-
+            tickers = await client_ws.get_all_tickers()
             for t in tickers:
-                symbol = t["symbol"]
-                if not symbol.endswith("USDT"):
-                    continue
-
-                price = float(t["price"])
-
-                change = await detect_signal(symbol, price)
-                if change is None:
-                    continue
-
-                if not await can_post_signal(symbol):
-                    continue
-
-                await send_signal(symbol, change, price)
-                await mark_signal_sent(symbol)
-
-            await asyncio.sleep(SCAN_INTERVAL)
-
+                s = t.get("symbol","")
+                if not s.endswith("USDT"): continue
+                symbol = s.replace("USDT","")
+                price = float(t.get("price",0))
+                state = symbol_state.get(symbol)
+                if state is None:
+                    state = {"trades": deque(maxlen=TRADE_WINDOW_SIZE), "last_avg_price": price, "last_volume":1.0}
+                    symbol_state[symbol] = state
+                state["trades"].append({"price":price,"qty":1.0})
+                trades = state["trades"]
+                volume_now = sum(x['price']*x['qty'] for x in trades)
+                price_now = sum(x['price'] for x in trades)/len(trades) if trades else price
+                prev_volume = state.get("last_volume",1.0)
+                prev_price = state.get("last_avg_price",price_now)
+                volume_spike = volume_now / (prev_volume+1e-9)
+                price_change = ((price_now-prev_price)/(prev_price+1e-9))*100
+                state["last_volume"]=volume_now
+                state["last_avg_price"]=price_now
+                if volume_spike>=VOLUME_SPIKE_THRESHOLD and price_change>=PRICE_CHANGE_THRESHOLD:
+                    asyncio.create_task(post_signal(symbol,price_now))
         except Exception as e:
-            print("Scan error:", e)
-            await asyncio.sleep(5)
+            print(f"[{datetime.now()}] ❌ Poll loop error: {e}")
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 # -----------------------------
-# MANUAL TELEGRAM COMMANDS
+# MAIN
 # -----------------------------
-@client.on(events.NewMessage(pattern="/price (.*)"))
-async def manual_price(event):
-    symbol = event.pattern_match.group(1).upper()
+async def main():
+    await tg_client.start(bot_token=BOT_TOKEN)
+    client_ws = await AsyncClient.create(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+    asyncio.create_task(poll_prices_loop(client_ws))
+    await tg_client.run_until_disconnected()
 
-    try:
-        binance = await AsyncClient.create()
-        data = await binance.get_symbol_ticker(symbol=symbol)
-        price = data["price"]
-        await event.respond(f"{symbol} price: {price}")
-    except:
-        await event.respond("Invalid symbol or Binance error.")
-
-# -----------------------------
-# FLASK SELF-PING SERVER
-# -----------------------------
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "Bot running"
-
-def run_flask():
-    app.run(host="0.0.0.0", port=10000)
-
-def self_ping():
-    while True:
-        try:
-            requests.get("http://localhost:10000")
-        except:
-            pass
-        time.sleep(60)
-
-# -----------------------------
-# START EVERYTHING
-# -----------------------------
-def main():
-    threading.Thread(target=run_flask, daemon=True).start()
-    threading.Thread(target=self_ping, daemon=True).start()
-
-    loop = asyncio.get_event_loop()
-    loop.create_task(scan_loop())
-    client.run_until_disconnected()
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__":
+    threading.Thread(target=run_web,daemon=True).start()
+    threading.Thread(target=self_ping,daemon=True).start()
+    try: asyncio.run(main())
+    except KeyboardInterrupt: print("Interrupted, exiting...")
