@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# premium_rest_safe_optimized.py - REST-only Binance Pre-Pump Scanner (Upstash + TP watcher)
+# premium_rest_safe_weight_safe.py
+# REST-only Binance Pre-Pump Scanner (Weight-Safe + TP watcher + Upstash)
 
 import os
 import asyncio
@@ -180,52 +181,55 @@ async def reset_daily_signals_loop():
         print(f"[{datetime.now()}] 🔄 Daily signal counter reset")
 
 # -----------------------------
-# DYNAMIC POLL INTERVAL
+# SAFE REST POLLING LOOP
 # -----------------------------
 COINS_COUNT = 440
+GROUP_SIZE = 110  # divide coins into groups to limit request weight
 UPSTASH_MONTH_LIMIT = 500_000
 DAYS_IN_MONTH = 30
 
 max_polls_month = UPSTASH_MONTH_LIMIT // COINS_COUNT
 polls_per_day = max_polls_month / DAYS_IN_MONTH
-POLL_INTERVAL_SECONDS = int(24*60*60 / polls_per_day)  # ≈ 38 minutes
+FULL_LOOP_INTERVAL = int(24*60*60 / polls_per_day)  # ~38 minutes
 
-# -----------------------------
-# REST POLLING LOOP
-# -----------------------------
-async def poll_prices_loop(client_ws):
-    print(f"[{datetime.now()}] ⏱ Polling loop started (interval={POLL_INTERVAL_SECONDS}s)")
+async def poll_group(client, group):
+    try:
+        tickers = await client.get_all_tickers()
+        for t in tickers:
+            if t['symbol'] not in group: 
+                continue
+            symbol = t['symbol'].replace("USDT","")
+            price = float(t['price'])
+            state = symbol_state.get(symbol)
+            if state is None:
+                state = {"trades": deque(maxlen=TRADE_WINDOW_SIZE), "last_avg_price": price, "last_volume":1.0}
+                symbol_state[symbol] = state
+            state["trades"].append({"price":price,"qty":1.0})
+            trades = state["trades"]
+            volume_now = sum(x['price']*x['qty'] for x in trades)
+            price_now = sum(x['price'] for x in trades)/len(trades) if trades else price
+            prev_volume = state.get("last_volume",1.0)
+            prev_price = state.get("last_avg_price",price_now)
+            volume_spike = volume_now / (prev_volume+1e-9)
+            price_change = ((price_now-prev_price)/(prev_price+1e-9))*100
+            state["last_volume"]=volume_now
+            state["last_avg_price"]=price_now
+            if volume_spike>=VOLUME_SPIKE_THRESHOLD and price_change>=PRICE_CHANGE_THRESHOLD:
+                asyncio.create_task(post_signal(symbol,price_now))
+            await upstash_set(f"last_price:{symbol}", {"price":price_now,"updated_at":datetime.now(timezone.utc).isoformat()})
+    except Exception as e:
+        print(f"[{datetime.now()}] ❌ Poll group error: {e}")
+
+async def safe_poll_loop(client, all_pairs):
+    groups = [all_pairs[i:i+GROUP_SIZE] for i in range(0, len(all_pairs), GROUP_SIZE)]
     while True:
-        try:
-            tickers = await client_ws.get_all_tickers()
-            for t in tickers:
-                s = t.get("symbol","")
-                if not s.endswith("USDT"): continue
-                symbol = s.replace("USDT","")
-                price = float(t.get("price",0))
-                state = symbol_state.get(symbol)
-                if state is None:
-                    state = {"trades": deque(maxlen=TRADE_WINDOW_SIZE), "last_avg_price": price, "last_volume":1.0}
-                    symbol_state[symbol] = state
-                state["trades"].append({"price":price,"qty":1.0})
-                trades = state["trades"]
-                volume_now = sum(x['price']*x['qty'] for x in trades)
-                price_now = sum(x['price'] for x in trades)/len(trades) if trades else price
-                prev_volume = state.get("last_volume",1.0)
-                prev_price = state.get("last_avg_price",price_now)
-                volume_spike = volume_now / (prev_volume+1e-9)
-                price_change = ((price_now-prev_price)/(prev_price+1e-9))*100
-                state["last_volume"]=volume_now
-                state["last_avg_price"]=price_now
-                if volume_spike>=VOLUME_SPIKE_THRESHOLD and price_change>=PRICE_CHANGE_THRESHOLD:
-                    asyncio.create_task(post_signal(symbol,price_now))
-                await upstash_set(f"last_price:{symbol}", {"price":price_now,"updated_at":datetime.now(timezone.utc).isoformat()})
-        except Exception as e:
-            print(f"[{datetime.now()}] ❌ Poll loop error: {e}")
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+        for group in groups:
+            await poll_group(client, group)
+            await asyncio.sleep(60)  # small delay between groups
+        await asyncio.sleep(FULL_LOOP_INTERVAL)
 
 # -----------------------------
-# TP WATCHER LOOP
+# TP WATCHER LOOP (unchanged)
 # -----------------------------
 async def tp_watcher_loop():
     print(f"[{datetime.now()}] ⏱ TP watcher started")
@@ -271,8 +275,9 @@ async def tp_watcher_loop():
 # -----------------------------
 async def main():
     await tg_client.start(bot_token=BOT_TOKEN)
+    all_pairs = [f"{symbol}USDT" for symbol in ["BTC","ETH","BNB","ADA","XRP"]*88]  # replace with actual 440 USDT symbols
     client_ws = await AsyncClient.create(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
-    asyncio.create_task(poll_prices_loop(client_ws))
+    asyncio.create_task(safe_poll_loop(client_ws, all_pairs))
     asyncio.create_task(tp_watcher_loop())
     asyncio.create_task(reset_daily_signals_loop())
     await tg_client.run_until_disconnected()
