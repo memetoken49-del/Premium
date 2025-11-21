@@ -285,42 +285,8 @@ async def safe_poll_loop(client, all_pairs):
         await asyncio.sleep(FULL_LOOP_INTERVAL)
 
 # -----------------------------
-# TP WATCHER
-# -----------------------------
-async def tp_watcher_loop():
-    while True:
-        symbols = await upstash_smembers("active_signals") or []
-        for symbol in symbols:
-            key = f"signal:{symbol}"
-            data = await upstash_get(key)
-            if not data:
-                await upstash_srem("active_signals", symbol)
-                continue
-            if isinstance(data, str):
-                try: data = json.loads(data)
-                except: data={}
-            lp = await upstash_get(f"last_price:{symbol}")
-            if not lp: continue
-            try:
-                current_price = float(lp.get("price",0))
-            except: continue
-            buy_price = float(data.get("buy_price",0))
-            sell_targets = data.get("sell_targets",[]) or []
-            hit_index = next((i for i,t in enumerate(sell_targets) if current_price>=float(t)), None)
-            if hit_index is not None:
-                profit_pct = ((float(sell_targets[hit_index]) - buy_price)/buy_price)*100*3.0
-                msg = f"#{symbol}/USDT TP {hit_index+1} ✅\nProfit: {profit_pct:.4f}% 📈"
-                msgs = data.get("msg_ids", [])
-                orig_msg_id = msgs[-1].get("msg_id") if msgs else None
-                await safe_send_telegram(msg, reply_to=orig_msg_id if orig_msg_id else None)
-                new_targets = sell_targets[hit_index+1:]
-                if new_targets:
-                    data["sell_targets"]=new_targets
-                    await upstash_set(key,data)
-                else:
-                    await upstash_srem("active_signals",symbol)
-                    await upstash_set(key,None)
-        await asyncio.sleep(60)
+
+
 
 # -----------------------------
 # MAIN
@@ -336,7 +302,6 @@ async def main():
         raise
 
     asyncio.create_task(safe_poll_loop(client, all_pairs))
-    asyncio.create_task(tp_watcher_loop())
     asyncio.create_task(reset_daily_signals_loop())
     await tg_client.run_until_disconnected()
 
