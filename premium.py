@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# premium_rest_advanced.py - REST-only Binance Pre-Pump Scanner (Advanced 4-factor detection, Upstash, TP watcher)
+# premium_rest_advanced_fixed.py
+# REST-only Binance Pre-Pump Scanner (Advanced 4-factor detection, Upstash-safe, TP watcher removed)
 
 import os
 import asyncio
@@ -16,7 +17,7 @@ from telethon import TelegramClient
 from binance import AsyncClient
 
 # -----------------------------
-# ENVIRONMENT VARIABLES
+# ENVIRONMENT / TUNABLES
 # -----------------------------
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
@@ -29,35 +30,33 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 UPSTASH_REST_URL = os.getenv("UPSTASH_REST_URL", "")
 UPSTASH_REDIS_TOKEN = os.getenv("UPSTASH_REDIS_TOKEN", "")
 
-# Safety defaults
-MIN_TRADE_USD = float(os.getenv("MIN_TRADE_USD", "500.0"))
-VOLUME_SPIKE_THRESHOLD = float(os.getenv("VOLUME_SPIKE_THRESHOLD", "2.5"))  # volatility spike multiplier
-PRICE_ACCEL_THRESHOLD = float(os.getenv("PRICE_ACCEL_THRESHOLD", 0.2))  # % acceleration
-UPTICK_STREAK = int(os.getenv("UPTICK_STREAK", 3))
-MA_SHORT_LEN = int(os.getenv("MA_SHORT_LEN", 5))
-MA_LONG_LEN = int(os.getenv("MA_LONG_LEN", 20))
-
+# Detection params (tweak these)
+VOLUME_SPIKE_THRESHOLD = float(os.getenv("VOLUME_SPIKE_THRESHOLD", "2.5"))  # volatility multiplier
+PRICE_ACCEL_THRESHOLD = float(os.getenv("PRICE_ACCEL_THRESHOLD", "0.2"))    # percent acceleration threshold
+UPTICK_STREAK = int(os.getenv("UPTICK_STREAK", "3"))
+MA_SHORT_LEN = int(os.getenv("MA_SHORT_LEN", "5"))
+MA_LONG_LEN = int(os.getenv("MA_LONG_LEN", "20"))
 TRADE_WINDOW_SIZE = int(os.getenv("TRADE_WINDOW_SIZE", "30"))
+
 MAX_SIGNALS_PER_DAY = int(os.getenv("MAX_SIGNALS_PER_DAY", "10"))
 SIGNAL_WINDOW_HOURS = int(os.getenv("SIGNAL_WINDOW_HOURS", "24"))
 
 GROUP_SIZE = int(os.getenv("GROUP_SIZE", "110"))
+
+# Upstash / interval tuning (keeps you under commands)
 UPSTASH_MONTH_LIMIT = int(os.getenv("UPSTASH_MONTH_LIMIT", "500000"))
 COINS_COUNT_APPROX = int(os.getenv("COINS_COUNT_APPROX", "440"))
 DAYS_IN_MONTH = int(os.getenv("DAYS_IN_MONTH", "30"))
 max_polls_month = UPSTASH_MONTH_LIMIT // max(1, COINS_COUNT_APPROX)
 polls_per_day = max_polls_month / max(1, DAYS_IN_MONTH)
-FULL_LOOP_INTERVAL = int(24*60*60 / polls_per_day)
+FULL_LOOP_INTERVAL = int(24 * 60 * 60 / max(1, polls_per_day))  # seconds per full loop
 
 # -----------------------------
-# TELEGRAM CLIENT
+# TELEGRAM / FLASK / CLIENTS
 # -----------------------------
 tg_client = TelegramClient("pre_pump_session", API_ID, API_HASH)
 tg_semaphore = asyncio.Semaphore(1)
 
-# -----------------------------
-# FLASK KEEP-ALIVE
-# -----------------------------
 app = Flask(__name__)
 @app.route("/")
 def home():
@@ -73,12 +72,12 @@ def self_ping():
         if url:
             try:
                 requests.get(url, timeout=10)
-            except:
+            except Exception:
                 pass
         time.sleep(240)
 
 # -----------------------------
-# UPSTASH HELPERS
+# UPSTASH HELPERS (sync -> thread)
 # -----------------------------
 UP_HEADERS = {"Authorization": f"Bearer {UPSTASH_REDIS_TOKEN}"}
 
@@ -87,7 +86,8 @@ def upstash_set_sync(key, value):
         resp = requests.post(f"{UPSTASH_REST_URL}/set/{key}", headers=UP_HEADERS, data=json.dumps(value), timeout=12)
         resp.raise_for_status()
         return resp.json()
-    except:
+    except Exception as e:
+        print(f"[{datetime.now()}] ❌ Upstash SET error key={key}: {e}")
         return None
 
 def upstash_get_sync(key):
@@ -95,7 +95,8 @@ def upstash_get_sync(key):
         resp = requests.get(f"{UPSTASH_REST_URL}/get/{key}", headers=UP_HEADERS, timeout=12)
         resp.raise_for_status()
         return resp.json().get("result")
-    except:
+    except Exception as e:
+        print(f"[{datetime.now()}] ❌ Upstash GET error key={key}: {e}")
         return None
 
 def upstash_sadd_sync(setname, member):
@@ -103,7 +104,8 @@ def upstash_sadd_sync(setname, member):
         resp = requests.get(f"{UPSTASH_REST_URL}/sadd/{setname}/{member}", headers=UP_HEADERS, timeout=12)
         resp.raise_for_status()
         return resp.json()
-    except:
+    except Exception as e:
+        print(f"[{datetime.now()}] ❌ Upstash SADD error {setname} {member}: {e}")
         return None
 
 def upstash_srem_sync(setname, member):
@@ -111,7 +113,8 @@ def upstash_srem_sync(setname, member):
         resp = requests.get(f"{UPSTASH_REST_URL}/srem/{setname}/{member}", headers=UP_HEADERS, timeout=12)
         resp.raise_for_status()
         return resp.json()
-    except:
+    except Exception as e:
+        print(f"[{datetime.now()}] ❌ Upstash SREM error {setname} {member}: {e}")
         return None
 
 def upstash_smembers_sync(setname):
@@ -119,7 +122,8 @@ def upstash_smembers_sync(setname):
         resp = requests.get(f"{UPSTASH_REST_URL}/smembers/{setname}", headers=UP_HEADERS, timeout=12)
         resp.raise_for_status()
         return resp.json().get("result") or []
-    except:
+    except Exception as e:
+        print(f"[{datetime.now()}] ❌ Upstash SMEMBERS error {setname}: {e}")
         return []
 
 # Async wrappers
@@ -132,18 +136,30 @@ async def upstash_smembers(setname): return await asyncio.to_thread(upstash_smem
 # -----------------------------
 # STATE
 # -----------------------------
-symbol_state = {}  # symbol -> {"trades", "last_avg_price", "last_volume", "vol_history", "upticks", "ma_short", "ma_long", "prev_delta"}
+# Per-symbol state; will be kept in memory.
+symbol_state = {}
+# structure per symbol:
+# {
+#   "trades": deque,
+#   "last_avg_price": float,
+#   "vol_history": deque,
+#   "upticks": int,
+#   "ma_short": deque,
+#   "ma_long": deque,
+#   "prev_price": float,
+#   "prev_prev_price": float
+# }
 
+# -----------------------------
+# UTIL / SIGNALS
+# -----------------------------
 def calculate_buy_sell_zones(price: float):
     sell_perc = [0.05, 0.12, 0.20, 0.35, 0.55, 0.85, 1.0]
-    sell_zones = [round(price*(1+x),6) for x in sell_perc]
-    buy1 = round(price*0.98,6)
-    buy2 = round(price*0.995*1.015,6)
+    sell_zones = [round(price*(1+x), 6) for x in sell_perc]
+    buy1 = round(price * 0.98, 6)
+    buy2 = round(price * 0.995 * 1.015, 6)
     return buy1, buy2, sell_zones
 
-# -----------------------------
-# TELEGRAM POSTING
-# -----------------------------
 async def safe_send_telegram(msg, reply_to=None):
     async with tg_semaphore:
         try:
@@ -152,7 +168,8 @@ async def safe_send_telegram(msg, reply_to=None):
             else:
                 sent = await tg_client.send_message(CHANNEL_ID, msg)
             return getattr(sent, "id", None)
-        except:
+        except Exception as e:
+            print(f"[{datetime.now()}] ❌ Telegram send failed: {e}")
             return None
 
 async def can_post_signal(symbol):
@@ -163,9 +180,9 @@ async def can_post_signal(symbol):
     if last:
         try:
             dt = datetime.fromisoformat(last)
-            if (datetime.now(timezone.utc) - dt).total_seconds() < SIGNAL_WINDOW_HOURS*3600:
+            if (datetime.now(timezone.utc) - dt).total_seconds() < SIGNAL_WINDOW_HOURS * 3600:
                 return False
-        except:
+        except Exception:
             pass
     return True
 
@@ -179,6 +196,7 @@ async def mark_signal_sent(symbol, payload=None):
 
 async def post_signal(symbol, price):
     if not await can_post_signal(symbol):
+        print(f"[{datetime.now()}] ⏱ Skipped {symbol} by TTL/daily limit")
         return
     buy1, buy2, sells = calculate_buy_sell_zones(price)
     msg = f"🚀 Binance\n#{symbol}/USDT\nBuy zone {buy1}-{buy2}\nSell zone {' - '.join([str(s) for s in sells])}\nMargin 3x"
@@ -193,121 +211,177 @@ async def post_signal(symbol, price):
         "posted_by": "bot"
     }
     await mark_signal_sent(symbol, payload)
+    # set last_price once at signal time
     await upstash_set(f"last_price:{symbol}", {"price": price, "updated_at": now_iso})
     print(f"[{datetime.now()}] ✅ Posted signal {symbol} at {price}")
 
 # -----------------------------
-# RESET DAILY SIGNALS
+# DAILY RESET
 # -----------------------------
 async def reset_daily_signals_loop():
     while True:
         now = datetime.now(timezone.utc)
         tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        await asyncio.sleep((tomorrow - now).total_seconds() + 1)
+        seconds = (tomorrow - now).total_seconds()
+        print(f"[{datetime.now()}] ⏱ Next reset in {int(seconds)}s")
+        await asyncio.sleep(seconds + 1)
         await upstash_set("signals_today", [])
         print(f"[{datetime.now()}] 🔄 Daily signal counter reset")
 
 # -----------------------------
-# ADVANCED POLL LOOP
+# POLLING / DETECTION (optimized)
 # -----------------------------
-async def poll_once_process(ticker_map, symbols_to_check):
+async def poll_once_process(ticker_map, symbols_to_check, active_set, last_price_updates):
+    """
+    Process symbols using ticker_map (symbolUSDT -> price).
+    active_set: set of symbols currently active (fetched once per full loop)
+    last_price_updates: dict to collect last_price updates for active symbols
+    """
+    eps = 1e-9
     for symbol in symbols_to_check:
         full = f"{symbol}USDT"
-        price = ticker_map.get(full)
-        if price is None:
+        raw = ticker_map.get(full)
+        if raw is None:
             continue
-        price = float(price)
+        price = float(raw)
 
-        # init state
         state = symbol_state.get(symbol)
         if state is None:
             state = {
                 "trades": deque(maxlen=TRADE_WINDOW_SIZE),
                 "last_avg_price": price,
-                "last_volume": 1.0,
                 "vol_history": deque(maxlen=30),
                 "upticks": 0,
                 "ma_short": deque(maxlen=MA_SHORT_LEN),
                 "ma_long": deque(maxlen=MA_LONG_LEN),
-                "prev_delta": 0.0
+                "prev_price": price,
+                "prev_prev_price": price
             }
             symbol_state[symbol] = state
 
         prev_price = state["last_avg_price"]
-        state["trades"].append({"price": price, "qty":1.0})
+        # update rolling "trades" price window
+        state["trades"].append({"price": price, "qty": 1.0})
         price_now = sum(t["price"] for t in state["trades"]) / len(state["trades"])
         state["last_avg_price"] = price_now
 
-        # Volatility spike
+        # volatility spike (abs price change vs local avg vol)
         vol = abs(price_now - prev_price)
         state["vol_history"].append(vol)
-        avg_vol = sum(state["vol_history"])/len(state["vol_history"])
-        vol_spike = vol / (avg_vol + 1e-9)
+        avg_vol = (sum(state["vol_history"]) / len(state["vol_history"])) if state["vol_history"] else eps
+        vol_spike = vol / (avg_vol + eps)
 
-        # Uptick streak
-        state["upticks"] = state["upticks"] +1 if price_now > prev_price else 0
+        # uptick streak
+        if price_now > prev_price:
+            state["upticks"] += 1
+        else:
+            state["upticks"] = 0
 
-        # MA5 / MA20
+        # MA short / long
         state["ma_short"].append(price_now)
         state["ma_long"].append(price_now)
-        ma5 = sum(state["ma_short"])/len(state["ma_short"])
-        ma20 = sum(state["ma_long"])/len(state["ma_long"])
+        ma_short = sum(state["ma_short"]) / len(state["ma_short"])
+        ma_long = sum(state["ma_long"]) / len(state["ma_long"])
 
-        # Acceleration
-        delta = price_now - prev_price
-        acceleration = delta - state["prev_delta"]
-        state["prev_delta"] = delta
+        # acceleration using two previous price points
+        prev_price_1 = state.get("prev_price", prev_price)
+        prev_price_2 = state.get("prev_prev_price", prev_price_1)
+        delta1 = price_now - prev_price_1
+        delta0 = prev_price_1 - prev_price_2
+        acceleration = delta1 - delta0
+        # store shifting history
+        state["prev_prev_price"] = prev_price_1
+        state["prev_price"] = price_now
+
+        accel_pct = (acceleration / (prev_price_1 + eps)) * 100.0
 
         # 4-factor detection
         if (vol_spike >= VOLUME_SPIKE_THRESHOLD and
-            acceleration/prev_price*100 >= PRICE_ACCEL_THRESHOLD and
+            accel_pct >= PRICE_ACCEL_THRESHOLD and
             state["upticks"] >= UPTICK_STREAK and
-            ma5 > ma20):
+            ma_short > ma_long):
+            # Post signal (async)
             asyncio.create_task(post_signal(symbol, price_now))
 
-        # Update last_price only for active signals
-        active = await upstash_smembers("active_signals") or []
-        if symbol in active:
-            await upstash_set(f"last_price:{symbol}", {"price": price_now, "updated_at": datetime.now(timezone.utc).isoformat()})
+        # collect last_price updates only for active symbols
+        if symbol in active_set:
+            # We'll write these once at the end of the full loop (reduce Upstash writes)
+            last_price_updates[symbol] = {"price": price_now, "updated_at": datetime.now(timezone.utc).isoformat()}
 
 async def safe_poll_loop(client, all_pairs):
+    # groups helps spread CPU, but Binance call is single per full loop
     groups = [all_pairs[i:i+GROUP_SIZE] for i in range(0, len(all_pairs), GROUP_SIZE)]
+    print(f"[{datetime.now()}] ⏱ Starting poll loop: {len(all_pairs)} pairs, {len(groups)} groups, full interval {FULL_LOOP_INTERVAL}s")
+
     while True:
         try:
+            # fetch all tickers once per full loop (single heavy Binance call)
             tickers = await client.get_all_tickers()
             ticker_map = {t['symbol']: t['price'] for t in tickers}
+            print(f"[{datetime.now()}] ⚡ Retrieved {len(ticker_map)} tickers")
+
+            # fetch active_signals once (reduces Upstash usage drastically)
+            active_list = await upstash_smembers("active_signals") or []
+            active_set = set(active_list)
+            print(f"[{datetime.now()}] ⚡ Active signals count: {len(active_set)}")
+
+            # we'll collect last_price updates for active symbols and flush them together
+            last_price_updates = {}
+
+            # process group-by-group (no extra Binance calls)
             for idx, group in enumerate(groups, start=1):
-                await poll_once_process(ticker_map, group)
-                await asyncio.sleep(1 + random.random()*2)
+                print(f"[{datetime.now()}] ▶ Processing group {idx}/{len(groups)} (size {len(group)})")
+                await poll_once_process(ticker_map, group, active_set, last_price_updates)
+                await asyncio.sleep(0.5 + random.random()*1.5)  # small pause to ease CPU & Upstash
+
+            # batch write last_price updates (one set per active symbol per full loop)
+            if last_price_updates:
+                print(f"[{datetime.now()}] 💾 Writing {len(last_price_updates)} last_price updates to Upstash (batched)")
+                for sym, payload in last_price_updates.items():
+                    await upstash_set(f"last_price:{sym}", payload)
+
         except Exception as e:
-            if "Way too much request weight" in str(e) or "IP banned" in str(e) or "429" in str(e):
-                await asyncio.sleep(60 + random.randint(30,180))
+            err = str(e)
+            print(f"[{datetime.now()}] ❌ Poll loop error: {err}")
+            # detect Binance rate-limit or IP ban messages and back off
+            if "Way too much request weight" in err or "IP banned" in err or "429" in err:
+                backoff = 60 + random.randint(30, 180)
+                print(f"[{datetime.now()}] 🔥 Detected Binance rate-limit — backing off for {backoff}s")
+                await asyncio.sleep(backoff)
+
+        print(f"[{datetime.now()}] ⏱ Full loop complete — sleeping {FULL_LOOP_INTERVAL}s")
         await asyncio.sleep(FULL_LOOP_INTERVAL)
-
-# -----------------------------
-
-
 
 # -----------------------------
 # MAIN
 # -----------------------------
 async def main():
+    print(f"[{datetime.now()}] 🟢 Starting Telegram client...")
     await tg_client.start(bot_token=BOT_TOKEN)
+    print(f"[{datetime.now()}] 🟢 Creating Binance AsyncClient...")
     client = await AsyncClient.create(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+
+    # fetch real USDT pairs
     try:
         info = await client.get_exchange_info()
-        all_pairs = [s["symbol"][:-4] for s in info.get("symbols",[]) if s["symbol"].endswith("USDT")]
+        all_pairs_full = [s["symbol"] for s in info.get("symbols", []) if s["symbol"].endswith("USDT")]
+        all_base_symbols = [p[:-4] for p in all_pairs_full]
+        print(f"[{datetime.now()}] ℹ Found {len(all_base_symbols)} USDT pairs")
     except Exception as e:
+        print(f"[{datetime.now()}] ❌ Failed to fetch exchange info: {e}")
         await client.close_connection()
         raise
 
-    asyncio.create_task(safe_poll_loop(client, all_pairs))
+    # start tasks: poll loop and daily reset only
+    asyncio.create_task(safe_poll_loop(client, all_base_symbols))
     asyncio.create_task(reset_daily_signals_loop())
+
+    print(f"[{datetime.now()}] 🟢 Background tasks started. Bot is running.")
     await tg_client.run_until_disconnected()
 
-if __name__=="__main__":
-    threading.Thread(target=run_web,daemon=True).start()
-    threading.Thread(target=self_ping,daemon=True).start()
+if __name__ == "__main__":
+    threading.Thread(target=run_web, daemon=True).start()
+    threading.Thread(target=self_ping, daemon=True).start()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
