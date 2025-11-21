@@ -229,14 +229,9 @@ async def reset_daily_signals_loop():
         print(f"[{datetime.now()}] 🔄 Daily signal counter reset")
 
 # -----------------------------
-# POLLING / DETECTION (optimized)
+# OPTIMIZED POLL LOOP (5-min interval)
 # -----------------------------
 async def poll_once_process(ticker_map, symbols_to_check, active_set, last_price_updates):
-    """
-    Process symbols using ticker_map (symbolUSDT -> price).
-    active_set: set of symbols currently active (fetched once per full loop)
-    last_price_updates: dict to collect last_price updates for active symbols
-    """
     eps = 1e-9
     for symbol in symbols_to_check:
         full = f"{symbol}USDT"
@@ -265,17 +260,14 @@ async def poll_once_process(ticker_map, symbols_to_check, active_set, last_price
         price_now = sum(t["price"] for t in state["trades"]) / len(state["trades"])
         state["last_avg_price"] = price_now
 
-        # volatility spike (abs price change vs local avg vol)
+        # volatility spike
         vol = abs(price_now - prev_price)
         state["vol_history"].append(vol)
-        avg_vol = (sum(state["vol_history"]) / len(state["vol_history"])) if state["vol_history"] else eps
+        avg_vol = sum(state["vol_history"]) / len(state["vol_history"]) if state["vol_history"] else eps
         vol_spike = vol / (avg_vol + eps)
 
         # uptick streak
-        if price_now > prev_price:
-            state["upticks"] += 1
-        else:
-            state["upticks"] = 0
+        state["upticks"] = state["upticks"] + 1 if price_now > prev_price else 0
 
         # MA short / long
         state["ma_short"].append(price_now)
@@ -283,75 +275,57 @@ async def poll_once_process(ticker_map, symbols_to_check, active_set, last_price
         ma_short = sum(state["ma_short"]) / len(state["ma_short"])
         ma_long = sum(state["ma_long"]) / len(state["ma_long"])
 
-        # acceleration using two previous price points
-        prev_price_1 = state.get("prev_price", prev_price)
-        prev_price_2 = state.get("prev_prev_price", prev_price_1)
-        delta1 = price_now - prev_price_1
-        delta0 = prev_price_1 - prev_price_2
+        # acceleration
+        delta1 = price_now - state["prev_price"]
+        delta0 = state["prev_price"] - state["prev_prev_price"]
         acceleration = delta1 - delta0
-        # store shifting history
-        state["prev_prev_price"] = prev_price_1
+        state["prev_prev_price"] = state["prev_price"]
         state["prev_price"] = price_now
-
-        accel_pct = (acceleration / (prev_price_1 + eps)) * 100.0
+        accel_pct = (acceleration / (state["prev_prev_price"] + eps)) * 100.0
 
         # 4-factor detection
         if (vol_spike >= VOLUME_SPIKE_THRESHOLD and
             accel_pct >= PRICE_ACCEL_THRESHOLD and
             state["upticks"] >= UPTICK_STREAK and
             ma_short > ma_long):
-            # Post signal (async)
             asyncio.create_task(post_signal(symbol, price_now))
 
         # collect last_price updates only for active symbols
         if symbol in active_set:
-            # We'll write these once at the end of the full loop (reduce Upstash writes)
             last_price_updates[symbol] = {"price": price_now, "updated_at": datetime.now(timezone.utc).isoformat()}
 
+
 async def safe_poll_loop(client, all_pairs):
-    # groups helps spread CPU, but Binance call is single per full loop
     groups = [all_pairs[i:i+GROUP_SIZE] for i in range(0, len(all_pairs), GROUP_SIZE)]
-    print(f"[{datetime.now()}] ⏱ Starting poll loop: {len(all_pairs)} pairs, {len(groups)} groups, full interval {FULL_LOOP_INTERVAL}s")
+    print(f"[{datetime.now()}] ⏱ Starting optimized poll loop ({len(all_pairs)} pairs)")
 
     while True:
         try:
-            # fetch all tickers once per full loop (single heavy Binance call)
             tickers = await client.get_all_tickers()
             ticker_map = {t['symbol']: t['price'] for t in tickers}
-            print(f"[{datetime.now()}] ⚡ Retrieved {len(ticker_map)} tickers")
 
-            # fetch active_signals once (reduces Upstash usage drastically)
             active_list = await upstash_smembers("active_signals") or []
             active_set = set(active_list)
-            print(f"[{datetime.now()}] ⚡ Active signals count: {len(active_set)}")
-
-            # we'll collect last_price updates for active symbols and flush them together
             last_price_updates = {}
 
-            # process group-by-group (no extra Binance calls)
             for idx, group in enumerate(groups, start=1):
-                print(f"[{datetime.now()}] ▶ Processing group {idx}/{len(groups)} (size {len(group)})")
                 await poll_once_process(ticker_map, group, active_set, last_price_updates)
-                await asyncio.sleep(0.5 + random.random()*1.5)  # small pause to ease CPU & Upstash
+                await asyncio.sleep(0.5 + random.random()*1.5)
 
-            # batch write last_price updates (one set per active symbol per full loop)
-            if last_price_updates:
-                print(f"[{datetime.now()}] 💾 Writing {len(last_price_updates)} last_price updates to Upstash (batched)")
-                for sym, payload in last_price_updates.items():
-                    await upstash_set(f"last_price:{sym}", payload)
+            # batch write last_price updates
+            for sym, payload in last_price_updates.items():
+                await upstash_set(f"last_price:{sym}", payload)
 
         except Exception as e:
             err = str(e)
             print(f"[{datetime.now()}] ❌ Poll loop error: {err}")
-            # detect Binance rate-limit or IP ban messages and back off
             if "Way too much request weight" in err or "IP banned" in err or "429" in err:
-                backoff = 60 + random.randint(30, 180)
-                print(f"[{datetime.now()}] 🔥 Detected Binance rate-limit — backing off for {backoff}s")
+                backoff = 60 + random.randint(30,180)
+                print(f"[{datetime.now()}] 🔥 Binance rate-limit — backing off {backoff}s")
                 await asyncio.sleep(backoff)
 
-        print(f"[{datetime.now()}] ⏱ Full loop complete — sleeping {FULL_LOOP_INTERVAL}s")
-        await asyncio.sleep(FULL_LOOP_INTERVAL)
-
+        print(f"[{datetime.now()}] ⏱ Full loop complete — sleeping 300s")
+        await asyncio.sleep(300)  # 5 minutes interval
 # -----------------------------
 # MAIN
 # -----------------------------
