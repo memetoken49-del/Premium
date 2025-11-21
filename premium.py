@@ -101,7 +101,11 @@ def upstash_get_sync(key):
 
 def upstash_sadd_sync(setname, member):
     try:
-        resp = requests.get(f"{UPSTASH_REST_URL}/sadd/{setname}/{member}", headers=UP_HEADERS, timeout=12)
+        resp = requests.post(
+            f"{UPSTASH_REST_URL}/sadd/{setname}/{member}",
+            headers=UP_HEADERS,
+            timeout=12
+        )
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
@@ -110,7 +114,11 @@ def upstash_sadd_sync(setname, member):
 
 def upstash_srem_sync(setname, member):
     try:
-        resp = requests.get(f"{UPSTASH_REST_URL}/srem/{setname}/{member}", headers=UP_HEADERS, timeout=12)
+        resp = requests.post(
+            f"{UPSTASH_REST_URL}/srem/{setname}/{member}",
+            headers=UP_HEADERS,
+            timeout=12
+        )
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
@@ -119,13 +127,16 @@ def upstash_srem_sync(setname, member):
 
 def upstash_smembers_sync(setname):
     try:
-        resp = requests.get(f"{UPSTASH_REST_URL}/smembers/{setname}", headers=UP_HEADERS, timeout=12)
+        resp = requests.post(
+            f"{UPSTASH_REST_URL}/smembers/{setname}",
+            headers=UP_HEADERS,
+            timeout=12
+        )
         resp.raise_for_status()
         return resp.json().get("result") or []
     except Exception as e:
         print(f"[{datetime.now()}] ❌ Upstash SMEMBERS error {setname}: {e}")
         return []
-
 # Async wrappers
 async def upstash_set(key, value): return await asyncio.to_thread(upstash_set_sync, key, value)
 async def upstash_get(key): return await asyncio.to_thread(upstash_get_sync, key)
