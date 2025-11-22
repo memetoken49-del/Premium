@@ -233,9 +233,12 @@ async def mark_signal_sent(symbol, payload=None):
         await upstash_sadd("active_signals", symbol)
 
 async def post_signal(symbol, price):
-    if not await can_post_signal(symbol):
-        print(f"[{datetime.now()}] ⏱ Skipped {symbol} by TTL/daily limit")
-        return
+    # per-symbol lock to avoid double posting same coin
+    lock = posting_locks.setdefault(symbol, asyncio.Lock())
+    async with lock:
+        if not await can_post_signal(symbol):
+            print(f"[{datetime.now()}] ⏱ Skipped {symbol} by TTL/daily limit")
+            return
     buy1, buy2, sells = calculate_buy_sell_zones(price)
     msg = f"🚀 Binance\n#{symbol}/USDT\nBuy zone {buy1}-{buy2}\nSell zone {' - '.join([str(s) for s in sells])}\nMargin 3x"
     msg_id = await safe_send_telegram(msg)
