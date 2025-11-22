@@ -83,20 +83,25 @@ UP_HEADERS = {"Authorization": f"Bearer {UPSTASH_REDIS_TOKEN}"}
 
 def upstash_set_sync(key, value):
     try:
-        # FIX: store plain string for timestamps (avoid double JSON encoding)
+        # If value is string, send raw; otherwise send JSON and appropriate header
         if isinstance(value, str):
             payload = value
+            headers = UP_HEADERS.copy()
         else:
             payload = json.dumps(value)
+            headers = UP_HEADERS.copy()
+            headers["Content-Type"] = "application/json"
 
         resp = requests.post(
             f"{UPSTASH_REST_URL}/set/{key}",
-            headers=UP_HEADERS,
+            headers=headers,
             data=payload,
             timeout=12
         )
         resp.raise_for_status()
-        return resp.json()
+        # return the 'result' field when present for easier checking
+        j = resp.json()
+        return j.get("result", j)
     except Exception as e:
         print(f"[{datetime.now()}] ❌ Upstash SET error key={key}: {e}")
         return None
@@ -198,16 +203,24 @@ async def can_post_signal(symbol):
     signals_today = await upstash_smembers("signals_today") or []
     if len(signals_today) >= MAX_SIGNALS_PER_DAY:
         return False
+
     last = await upstash_get(f"last_signal:{symbol}")
     if last:
-    try:
-        # FIX: remove extra quotes from Upstash stored string
-        last = last.strip('"')
-        dt = datetime.fromisoformat(last)
+        try:
+            # remove possible extra quotes, spaces
+            if isinstance(last, str):
+                last_clean = last.strip().strip('"')
+            else:
+                # if Upstash returned a JSON-ish object, try to get string
+                last_clean = str(last)
+
+            dt = datetime.fromisoformat(last_clean)
             if (datetime.now(timezone.utc) - dt).total_seconds() < SIGNAL_WINDOW_HOURS * 3600:
                 return False
         except Exception:
+            # parsing failed -> treat as no valid last signal
             pass
+
     return True
 
 async def mark_signal_sent(symbol, payload=None):
