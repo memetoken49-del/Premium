@@ -216,7 +216,7 @@ async def reply_x3_profit(chat_id, reply_to_msg_id):
         match = re.search(r"Profit:\s*([\d.]+)%", orig_text)
         if not match:
             msg = "⚠️ Could not detect profit value in original message."
-            return await safe_send_telegram(msg, reply_to=reply_to_msg_id)
+            return await safe_send_telegram(msg, chat_id=chat_id, reply_to=reply_to_msg_id)
 
         # 3. Multiply ×3
         percent = float(match.group(1))
@@ -226,7 +226,7 @@ async def reply_x3_profit(chat_id, reply_to_msg_id):
         msg = f"Profit: {x3}% 📈 (x3 leverage)"
 
         # 5. Send reply
-        return await safe_send_telegram(msg, reply_to=reply_to_msg_id)
+        return await safe_send_telegram(msg, chat_id=chat_id, reply_to=reply_to_msg_id)
 
     except Exception as e:
         print(f"[{datetime.now()}] ❌ reply_x3_profit error: {e}")
