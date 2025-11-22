@@ -199,6 +199,37 @@ async def safe_send_telegram(msg, reply_to=None):
         except Exception as e:
             print(f"[{datetime.now()}] ❌ Telegram send failed: {e}")
             return None
+            
+# -----------------------------
+# PROFIT X3 REPLY FEATURE
+# -----------------------------
+import re
+
+async def reply_x3_profit(chat_id, reply_to_msg_id):
+    try:
+        # 1. Read original Telegram message
+        orig = await tg_client.get_messages(chat_id, ids=reply_to_msg_id)
+        orig_text = orig.message or ""
+
+        # 2. Extract "Profit: X%"
+        match = re.search(r"Profit:\s*([\d.]+)%", orig_text)
+        if not match:
+            msg = "⚠️ Could not detect profit value in original message."
+            return await safe_send_telegram(msg, reply_to=reply_to_msg_id)
+
+        # 3. Multiply ×3
+        percent = float(match.group(1))
+        x3 = round(percent * 3, 4)
+
+        # 4. Build reply message
+        msg = f"Profit: {x3}% 📈 (x3 leverage)"
+
+        # 5. Send reply
+        return await safe_send_telegram(msg, reply_to=reply_to_msg_id)
+
+    except Exception as e:
+        print(f"[{datetime.now()}] ❌ reply_x3_profit error: {e}")
+        return None
 
 async def can_post_signal(symbol):
     signals_today = await upstash_smembers("signals_today") or []
