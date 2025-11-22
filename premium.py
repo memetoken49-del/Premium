@@ -188,13 +188,14 @@ def calculate_buy_sell_zones(price: float):
     buy2 = round(price * 0.995 * 1.015, 6)
     return buy1, buy2, sell_zones
 
-async def safe_send_telegram(msg, reply_to=None):
+async def safe_send_telegram(msg, chat_id=None, reply_to=None):
     async with tg_semaphore:
         try:
+            target = chat_id if chat_id is not None else CHANNEL_ID
             if reply_to:
-                sent = await tg_client.send_message(CHANNEL_ID, msg, reply_to=reply_to)
+                sent = await tg_client.send_message(target, msg, reply_to=reply_to)
             else:
-                sent = await tg_client.send_message(CHANNEL_ID, msg)
+                sent = await tg_client.send_message(target, msg)
             return getattr(sent, "id", None)
         except Exception as e:
             print(f"[{datetime.now()}] ❌ Telegram send failed: {e}")
