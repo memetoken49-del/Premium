@@ -301,7 +301,7 @@ async def post_signal(symbol, price):
             print(f"[{datetime.now()}] ❌ post_signal error for {symbol}: {e}")
 
 # -----------------------------
-# DAILY RESET
+# DAILY RESET (SAFE VERSION)
 # -----------------------------
 async def reset_daily_signals_loop():
     while True:
@@ -310,8 +310,15 @@ async def reset_daily_signals_loop():
         seconds = (tomorrow - now).total_seconds()
         print(f"[{datetime.now()}] ⏱ Next reset in {int(seconds)}s")
         await asyncio.sleep(seconds + 1)
-        await upstash_set("signals_today", [])
-        print(f"[{datetime.now()}] 🔄 Daily signal counter reset")
+
+        print(f"[{datetime.now()}] 🔄 Resetting signals_today safely...")
+
+        # Safely remove each member (avoids SET type overwrite)
+        members = await upstash_smembers("signals_today") or []
+        for m in members:
+            await upstash_srem("signals_today", m)
+
+        print(f"[{datetime.now()}] 🔄 Daily signal counter reset (safe-clean)")
 
 # -----------------------------
 # OPTIMIZED POLL LOOP (5-min interval)
