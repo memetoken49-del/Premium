@@ -83,7 +83,18 @@ UP_HEADERS = {"Authorization": f"Bearer {UPSTASH_REDIS_TOKEN}"}
 
 def upstash_set_sync(key, value):
     try:
-        resp = requests.post(f"{UPSTASH_REST_URL}/set/{key}", headers=UP_HEADERS, data=json.dumps(value), timeout=12)
+        # FIX: store plain string for timestamps (avoid double JSON encoding)
+        if isinstance(value, str):
+            payload = value
+        else:
+            payload = json.dumps(value)
+
+        resp = requests.post(
+            f"{UPSTASH_REST_URL}/set/{key}",
+            headers=UP_HEADERS,
+            data=payload,
+            timeout=12
+        )
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
@@ -189,8 +200,10 @@ async def can_post_signal(symbol):
         return False
     last = await upstash_get(f"last_signal:{symbol}")
     if last:
-        try:
-            dt = datetime.fromisoformat(last)
+    try:
+        # FIX: remove extra quotes from Upstash stored string
+        last = last.strip('"')
+        dt = datetime.fromisoformat(last)
             if (datetime.now(timezone.utc) - dt).total_seconds() < SIGNAL_WINDOW_HOURS * 3600:
                 return False
         except Exception:
