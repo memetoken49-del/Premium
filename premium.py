@@ -202,7 +202,7 @@ async def safe_send_telegram(msg, chat_id=None, reply_to=None):
             return None
             
 # -----------------------------
-# PROFIT X3 REPLY FEATURE
+# PROFIT X3 REPLY FEATURE (robust)
 # -----------------------------
 import re
 
@@ -212,20 +212,24 @@ async def reply_x3_profit(chat_id, reply_to_msg_id):
         orig = await tg_client.get_messages(chat_id, ids=reply_to_msg_id)
         orig_text = orig.message or ""
 
-        # 2. Extract "Profit: X%"
-        match = re.search(r"Profit:\s*([\d.]+)%", orig_text)
+        # 2. Normalize spaces and remove invisible chars
+        orig_text = orig_text.replace('\xa0', ' ').replace('\u200b', '')  # non-breaking / zero-width spaces
+        orig_text = orig_text.strip()
+
+        # 3. Robust regex to match "Profit: X%" anywhere in the text
+        match = re.search(r"Profit\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*%", orig_text, re.IGNORECASE)
         if not match:
             msg = "⚠️ Could not detect profit value in original message."
             return await safe_send_telegram(msg, chat_id=chat_id, reply_to=reply_to_msg_id)
 
-        # 3. Multiply ×3
+        # 4. Multiply ×3 and round to 2 decimals
         percent = float(match.group(1))
-        x3 = round(percent * 3, 4)
+        x3 = round(percent * 3, 2)
 
-        # 4. Build reply message
+        # 5. Build reply message
         msg = f"Profit: {x3}% 📈 (x3 leverage)"
 
-        # 5. Send reply
+        # 6. Send reply
         return await safe_send_telegram(msg, chat_id=chat_id, reply_to=reply_to_msg_id)
 
     except Exception as e:
