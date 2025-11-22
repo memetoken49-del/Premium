@@ -236,25 +236,29 @@ async def post_signal(symbol, price):
     # per-symbol lock to avoid double posting same coin
     lock = posting_locks.setdefault(symbol, asyncio.Lock())
     async with lock:
-        if not await can_post_signal(symbol):
-            print(f"[{datetime.now()}] ⏱ Skipped {symbol} by TTL/daily limit")
-            return
-    buy1, buy2, sells = calculate_buy_sell_zones(price)
-    msg = f"🚀 Binance\n#{symbol}/USDT\nBuy zone {buy1}-{buy2}\nSell zone {' - '.join([str(s) for s in sells])}\nMargin 3x"
-    msg_id = await safe_send_telegram(msg)
-    now_iso = datetime.now(timezone.utc).isoformat()
-    payload = {
-        "msg_ids": [{"msg_id": msg_id, "posted_at": now_iso}],
-        "symbol": symbol,
-        "buy_price": price,
-        "sell_targets": sells,
-        "posted_at": now_iso,
-        "posted_by": "bot"
-    }
-    await mark_signal_sent(symbol, payload)
-    # set last_price once at signal time
-    await upstash_set(f"last_price:{symbol}", {"price": price, "updated_at": now_iso})
-    print(f"[{datetime.now()}] ✅ Posted signal {symbol} at {price}")
+        try:
+            if not await can_post_signal(symbol):
+                print(f"[{datetime.now()}] ⏱ Skipped {symbol} by TTL/daily limit")
+                return
+
+            buy1, buy2, sells = calculate_buy_sell_zones(price)
+            msg = f"🚀 Binance\n#{symbol}/USDT\nBuy zone {buy1}-{buy2}\nSell zone {' - '.join([str(s) for s in sells])}\nMargin 3x"
+            msg_id = await safe_send_telegram(msg)
+            now_iso = datetime.now(timezone.utc).isoformat()
+            payload = {
+                "msg_ids": [{"msg_id": msg_id, "posted_at": now_iso}],
+                "symbol": symbol,
+                "buy_price": price,
+                "sell_targets": sells,
+                "posted_at": now_iso,
+                "posted_by": "bot"
+            }
+            await mark_signal_sent(symbol, payload)
+            # set last_price once at signal time
+            await upstash_set(f"last_price:{symbol}", {"price": price, "updated_at": now_iso})
+            print(f"[{datetime.now()}] ✅ Posted signal {symbol} at {price}")
+        except Exception as e:
+            print(f"[{datetime.now()}] ❌ post_signal error for {symbol}: {e}")
 
 # -----------------------------
 # DAILY RESET
