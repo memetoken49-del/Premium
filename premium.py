@@ -231,6 +231,15 @@ async def reply_x3_profit(chat_id, reply_to_msg_id):
         print(f"[{datetime.now()}] ❌ reply_x3_profit error: {e}")
         return None
 
+from telethon import events
+
+@tg_client.on(events.NewMessage)
+async def handler(event):
+    # Only trigger when this message is a reply to another message
+    if event.is_reply:
+        # Reply to the original message, not the command
+        await reply_x3_profit(event.chat_id, event.reply_to_msg_id)
+
 async def can_post_signal(symbol):
     signals_today = await upstash_smembers("signals_today") or []
     if len(signals_today) >= MAX_SIGNALS_PER_DAY:
