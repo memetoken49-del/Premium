@@ -165,6 +165,7 @@ async def upstash_smembers(setname): return await asyncio.to_thread(upstash_smem
 # -----------------------------
 # Per-symbol state; will be kept in memory.
 symbol_state = {}
+posting_locks = {}
 # structure per symbol:
 # {
 #   "trades": deque,
